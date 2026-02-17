@@ -477,11 +477,11 @@ def page_schedule():
 
     st.divider()
 
-    # -- Filters --
+    # -- Helpers --
     import re as _re
+    from collections import defaultdict as _defaultdict
 
     def _extract_level(title: str) -> str:
-        """Pull a skill-level tag like '3.0-3.5' or '4.0+' from the title."""
         m = _re.search(r'(\d\.\d\s*[-–]\s*\d\.\d\+?)', title)
         if m:
             return m.group(1).replace(" ", "")
@@ -506,27 +506,31 @@ def page_schedule():
             return "Open Play"
         return "Other"
 
-    # Build unique filter values from the loaded events
+    TYPE_COLORS = {
+        "Drill / Clinic": "#e67e22",
+        "Open Play": "#27ae60",
+        "Round Robin": "#2980b9",
+        "League": "#8e44ad",
+        "Tournament": "#c0392b",
+        "Other": "#7f8c8d",
+    }
+
+    # -- Filters --
     all_levels = sorted({_extract_level(ev.title) for ev in events} - {""})
     all_types = sorted({_session_type(ev.title) for ev in events})
 
     fc1, fc2 = st.columns(2)
     with fc1:
         selected_levels = st.multiselect(
-            "Filter by level",
-            options=all_levels,
-            default=[],
+            "Filter by level", options=all_levels, default=[],
             help="Leave empty to show all levels.",
         )
     with fc2:
         selected_types = st.multiselect(
-            "Filter by session type",
-            options=all_types,
-            default=[],
-            help="Leave empty to show all types. 'Drill / Clinic' includes drills, clinics, lessons, etc.",
+            "Filter by session type", options=all_types, default=[],
+            help="Leave empty to show all types.",
         )
 
-    # Apply filters
     filtered_events = events
     if selected_levels:
         filtered_events = [ev for ev in filtered_events if _extract_level(ev.title) in selected_levels]
@@ -538,170 +542,258 @@ def page_schedule():
 
     st.divider()
 
-    # -- Group events by date --
-    from itertools import groupby as _groupby
+    # ----------------------------------------------------------------
+    # Calendar grid view: hours (Y) x days (X)
+    # ----------------------------------------------------------------
 
-    def _time_of_day(ev: Event) -> str:
+    # Group events by date
+    events_by_date: dict[str, list[Event]] = _defaultdict(list)
+    for ev in filtered_events:
         try:
-            hour = datetime.fromisoformat(ev.start).hour
+            date_key = datetime.fromisoformat(ev.start).strftime("%Y-%m-%d")
         except Exception:
-            return ""
-        if hour < 12:
-            return "Morning"
-        elif hour < 17:
-            return "Afternoon"
-        return "Evening"
+            date_key = "unknown"
+        events_by_date[date_key].append(ev)
 
-    def _time_short(ev: Event) -> str:
+    sorted_dates = sorted(events_by_date.keys())
+    if not sorted_dates:
+        st.info("No events match your filters.")
+        return
+
+    # Find the hour range across all events
+    min_hour, max_hour = 23, 0
+    for ev in filtered_events:
         try:
-            return datetime.fromisoformat(ev.start).strftime("%I:%M %p").lstrip("0")
+            h = datetime.fromisoformat(ev.start).hour
+            min_hour = min(min_hour, h)
+            max_hour = max(max_hour, h)
         except Exception:
-            return ""
+            pass
+    # Pad by 1 hour each direction for breathing room
+    min_hour = max(0, min_hour - 1)
+    max_hour = min(23, max_hour + 1)
 
-    def _level_badge(title: str) -> str:
-        lvl = _extract_level(title)
-        return f" `{lvl}`" if lvl else ""
-
-    def _type_badge(title: str) -> str:
-        t = _session_type(title)
-        colors = {
-            "Drill / Clinic": "🟠",
-            "Open Play": "🟢",
-            "Round Robin": "🔵",
-            "League": "🟣",
-            "Tournament": "🏆",
-        }
-        icon = colors.get(t, "⚪")
-        return f" {icon} {t}"
-
-    for date_key, date_events in _groupby(filtered_events, key=lambda e: e.display_date()):
-        date_events_list = list(date_events)
+    # Build events lookup: (date, hour) -> list of events
+    grid: dict[tuple[str, int], list[Event]] = _defaultdict(list)
+    for ev in filtered_events:
         try:
-            date_label = datetime.fromisoformat(date_events_list[0].start).strftime("%A, %b %d")
+            dt = datetime.fromisoformat(ev.start)
+            grid[(dt.strftime("%Y-%m-%d"), dt.hour)].append(ev)
         except Exception:
-            date_label = date_key
-        st.subheader(f"{date_label}  ({len(date_events_list)})")
+            pass
 
-        for ev in date_events_list:
-            time_str = _time_short(ev)
-            club_tag = f" — {ev.club or ev.location}" if ev.club or ev.location else ""
-            label = f"{time_str}  |  **{ev.title}**{_level_badge(ev.title)}{_type_badge(ev.title)}{club_tag}"
+    # Render the calendar grid as HTML
+    # Column headers = days, row headers = hours
+    n_days = len(sorted_dates)
 
-            with st.expander(label):
-                st.caption(ev.display_time())
-                if ev.location:
-                    st.caption(ev.location)
+    # Build date labels
+    date_labels = {}
+    for d in sorted_dates:
+        try:
+            dt = datetime.fromisoformat(d)
+            date_labels[d] = f"{dt.strftime('%a')}<br><b>{dt.strftime('%b %d')}</b>"
+        except Exception:
+            date_labels[d] = d
 
-                # Action buttons in a row
-                btn1, btn2, btn3, btn4 = st.columns(4)
+    # CSS + HTML for the calendar
+    col_width = max(140, 700 // n_days)
 
-                if btn1.button("Check", key=f"check_{ev.event_id}", use_container_width=True):
-                    reg = api.get_event_registration(session, ev.event_id)
-                    if reg:
-                        if reg.has_spots:
-                            st.success(f"{reg.remaining_spots} spot(s) available!")
-                        elif reg.has_waitlist:
-                            st.warning(f"Full — waitlist ({reg.total_waitlisted} waiting)")
+    css = f"""
+    <style>
+    .cal-grid {{ width: 100%; border-collapse: collapse; table-layout: fixed; }}
+    .cal-grid th {{ background: #1a1a2e; color: #eee; padding: 8px 4px; text-align: center;
+                    font-size: 13px; border: 1px solid #333; width: {col_width}px; }}
+    .cal-grid th.hour-col {{ width: 60px; min-width: 60px; }}
+    .cal-grid td {{ border: 1px solid #2a2a3e; vertical-align: top; padding: 2px; height: 30px; }}
+    .cal-grid td.hour-label {{ background: #1a1a2e; color: #aaa; text-align: right; padding: 4px 8px;
+                               font-size: 12px; font-weight: 600; white-space: nowrap; }}
+    .cal-block {{ border-radius: 4px; padding: 3px 6px; margin: 1px 0; font-size: 11px;
+                  color: #fff; cursor: default; line-height: 1.3; overflow: hidden; }}
+    .cal-block .cal-time {{ font-weight: 700; }}
+    .cal-block .cal-title {{ display: block; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }}
+    .cal-block .cal-level {{ opacity: 0.85; font-size: 10px; }}
+    .cal-block .cal-club {{ opacity: 0.7; font-size: 10px; display: block; white-space: nowrap;
+                            overflow: hidden; text-overflow: ellipsis; }}
+    </style>
+    """
+
+    rows_html = ""
+    for hour in range(min_hour, max_hour + 1):
+        hour_label = datetime(2000, 1, 1, hour).strftime("%I %p").lstrip("0")
+        cells = f'<td class="hour-label">{hour_label}</td>'
+        for d in sorted_dates:
+            cell_events = grid.get((d, hour), [])
+            blocks = ""
+            for ev in cell_events:
+                stype = _session_type(ev.title)
+                bg = TYPE_COLORS.get(stype, "#555")
+                level = _extract_level(ev.title)
+                level_html = f' <span class="cal-level">{level}</span>' if level else ""
+                try:
+                    t = datetime.fromisoformat(ev.start).strftime("%I:%M").lstrip("0")
+                except Exception:
+                    t = ""
+                club_html = f'<span class="cal-club">{ev.club or ev.location}</span>' if (ev.club or ev.location) else ""
+                blocks += (
+                    f'<div class="cal-block" style="background:{bg}" title="{ev.title}">'
+                    f'<span class="cal-time">{t}</span>{level_html} '
+                    f'<span class="cal-title">{ev.title}</span>'
+                    f'{club_html}</div>'
+                )
+            cells += f"<td>{blocks}</td>"
+        rows_html += f"<tr>{cells}</tr>"
+
+    header_cells = '<th class="hour-col"></th>' + "".join(
+        f"<th>{date_labels[d]}</th>" for d in sorted_dates
+    )
+    table_html = f'{css}<table class="cal-grid"><thead><tr>{header_cells}</tr></thead><tbody>{rows_html}</tbody></table>'
+
+    st.markdown(table_html, unsafe_allow_html=True)
+
+    # Legend
+    legend_items = " &nbsp; ".join(
+        f'<span style="display:inline-block;width:12px;height:12px;background:{c};'
+        f'border-radius:2px;vertical-align:middle"></span> {t}'
+        for t, c in TYPE_COLORS.items() if t in all_types
+    )
+    if legend_items:
+        st.markdown(f"<div style='font-size:12px;color:#aaa;margin-top:4px'>{legend_items}</div>", unsafe_allow_html=True)
+
+    st.caption(f"{len(filtered_events)} session(s) across {len(sorted_dates)} day(s)")
+
+    # ----------------------------------------------------------------
+    # Session detail + actions (below the calendar)
+    # ----------------------------------------------------------------
+    st.divider()
+    st.subheader("Session Actions")
+
+    # Build a flat list for the selectbox
+    event_options: dict[str, Event] = {}
+    for ev in filtered_events:
+        try:
+            dt = datetime.fromisoformat(ev.start)
+            time_str = dt.strftime("%a %b %d %I:%M %p").lstrip("0")
+        except Exception:
+            time_str = ev.start
+        club_tag = f" @ {ev.club or ev.location}" if (ev.club or ev.location) else ""
+        label = f"{time_str} — {ev.title}{club_tag}"
+        event_options[label] = ev
+
+    selected_label = st.selectbox("Select a session", options=list(event_options.keys()))
+    if selected_label:
+        ev = event_options[selected_label]
+        st.markdown(f"**{ev.title}**")
+        st.caption(f"{ev.display_time()} | {ev.location or ev.club or ''}")
+
+        btn1, btn2, btn3, btn4 = st.columns(4)
+
+        if btn1.button("Check Availability", key=f"check_{ev.event_id}", use_container_width=True):
+            reg = api.get_event_registration(session, ev.event_id)
+            if reg:
+                if reg.has_spots:
+                    st.success(f"{reg.remaining_spots} spot(s) available!")
+                elif reg.has_waitlist:
+                    st.warning(f"Full — waitlist ({reg.total_waitlisted} waiting)")
+                else:
+                    st.error("Closed")
+
+                if reg.registration_opens_at:
+                    st.info(reg.registration_opens_at)
+
+                if reg.too_soon_minutes and ev.start:
+                    try:
+                        event_start_dt = datetime.fromisoformat(ev.start)
+                        opens_at_dt = event_start_dt - timedelta(minutes=reg.too_soon_minutes)
+                        from datetime import timezone as _tz2
+                        now = datetime.now(tz=opens_at_dt.tzinfo or _tz2.utc)
+                        time_until = (opens_at_dt - now).total_seconds()
+                        if time_until > 0:
+                            countdown = scheduler._format_countdown(time_until)
+                            st.info(
+                                f"Registration opens **{opens_at_dt.strftime('%a %b %d, %I:%M %p')}** "
+                                f"(in {countdown})"
+                            )
+                    except Exception:
+                        pass
+
+                if reg.register_cta_text:
+                    st.caption(f"CTA: {reg.register_cta_text} {'(disabled)' if reg.register_disabled else ''}")
+
+                for m in reg.unregistered_members:
+                    st.caption(f"Eligible: {m.get('name')} (ID {m.get('id')})")
+                for m in reg.registered_members:
+                    st.caption(f"Already registered: {m.get('name')}")
+
+                if reg.unregistered_members or reg.registered_members:
+                    api.discover_members(session, ev.event_id)
+            else:
+                st.error("Could not fetch availability.")
+
+        if btn2.button("Add to Watchlist", key=f"watch_{ev.event_id}", use_container_width=True):
+            if not selected_member_ids:
+                st.error("Select at least one member above.")
+            else:
+                monitor.watch(ev, selected_email, [int(mid) for mid in selected_member_ids])
+                names = selected_member_labels if selected_member_labels else selected_member_ids
+                st.success(f"Watching **{ev.title}** for {names}")
+
+        if btn3.button("Register NOW", key=f"reg_{ev.event_id}", use_container_width=True):
+            if not selected_member_ids:
+                st.error("Select at least one member above.")
+            else:
+                with st.spinner("Registering …"):
+                    try:
+                        if not session or not session.authenticated or session.is_expired():
+                            session = api.ensure_authenticated(acct["email"], acct["password"])
+                        if not session or not session.authenticated:
+                            st.error("Login failed — check credentials in Accounts tab.")
                         else:
-                            st.error("Closed")
-
-                        if reg.registration_opens_at:
-                            st.info(reg.registration_opens_at)
-
-                        if reg.too_soon_minutes and ev.start:
-                            try:
-                                event_start_dt = datetime.fromisoformat(ev.start)
-                                opens_at_dt = event_start_dt - timedelta(minutes=reg.too_soon_minutes)
-                                from datetime import timezone as _tz2
-                                now = datetime.now(tz=opens_at_dt.tzinfo or _tz2.utc)
-                                time_until = (opens_at_dt - now).total_seconds()
-                                if time_until > 0:
-                                    countdown = scheduler._format_countdown(time_until)
-                                    st.info(
-                                        f"Registration opens **{opens_at_dt.strftime('%a %b %d, %I:%M %p')}** "
-                                        f"(in {countdown})"
-                                    )
-                            except Exception:
-                                pass
-
-                        if reg.register_cta_text:
-                            st.caption(f"CTA: {reg.register_cta_text} {'(disabled)' if reg.register_disabled else ''}")
-
-                        for m in reg.unregistered_members:
-                            st.caption(f"Eligible: {m.get('name')} (ID {m.get('id')})")
-                        for m in reg.registered_members:
-                            st.caption(f"Already registered: {m.get('name')}")
-
-                        if reg.unregistered_members or reg.registered_members:
-                            api.discover_members(session, ev.event_id)
-                    else:
-                        st.error("Could not fetch availability.")
-
-                if btn2.button("Watch", key=f"watch_{ev.event_id}", use_container_width=True):
-                    if not selected_member_ids:
-                        st.error("Select at least one member above.")
-                    else:
-                        monitor.watch(ev, selected_email, [int(mid) for mid in selected_member_ids])
-                        names = selected_member_labels if selected_member_labels else selected_member_ids
-                        st.success(f"Watching **{ev.title}** for {names}")
-
-                if btn3.button("Register", key=f"reg_{ev.event_id}", use_container_width=True):
-                    if not selected_member_ids:
-                        st.error("Select at least one member above.")
-                    else:
-                        with st.spinner("Registering …"):
-                            try:
-                                if not session or not session.authenticated or session.is_expired():
-                                    session = api.ensure_authenticated(acct["email"], acct["password"])
-                                if not session or not session.authenticated:
-                                    st.error("Login failed — check credentials in Accounts tab.")
+                            member_ids_int = [int(mid) for mid in selected_member_ids]
+                            result = api.register(session, ev.event_id, member_ids_int)
+                            if result.success:
+                                verification = api.verify_registration(session, ev.event_id, member_ids_int)
+                                if verification == "waitlisted":
+                                    st.warning("WAITLISTED — session is full.")
                                 else:
-                                    member_ids_int = [int(mid) for mid in selected_member_ids]
-                                    result = api.register(session, ev.event_id, member_ids_int)
-                                    if result.success:
-                                        verification = api.verify_registration(session, ev.event_id, member_ids_int)
-                                        if verification == "waitlisted":
-                                            st.warning("WAITLISTED — session is full.")
-                                        else:
-                                            st.success(f"CONFIRMED! {result.message}")
-                                    elif result.waitlisted:
-                                        st.warning(f"WAITLISTED — {result.message}")
-                                    else:
-                                        st.error(f"Failed: {result.message}")
-                            except Exception as exc:
-                                st.error(f"Registration error: {exc}")
+                                    st.success(f"CONFIRMED! {result.message}")
+                            elif result.waitlisted:
+                                st.warning(f"WAITLISTED — {result.message}")
+                            else:
+                                st.error(f"Failed: {result.message}")
+                    except Exception as exc:
+                        st.error(f"Registration error: {exc}")
 
-                if btn4.button("Snipe", key=f"snipe_{ev.event_id}", use_container_width=True):
-                    if not selected_member_ids:
-                        st.error("Select at least one member above.")
-                    else:
-                        member_ids_int = [int(mid) for mid in selected_member_ids]
-                        ws = monitor.watch(ev, selected_email, member_ids_int)
+        if btn4.button("Auto-Register (Snipe)", key=f"snipe_{ev.event_id}", use_container_width=True):
+            if not selected_member_ids:
+                st.error("Select at least one member above.")
+            else:
+                member_ids_int = [int(mid) for mid in selected_member_ids]
+                ws = monitor.watch(ev, selected_email, member_ids_int)
 
-                        reg = api.get_event_registration(session, ev.event_id)
-                        if reg and reg.too_soon_minutes and ev.start:
-                            try:
-                                from datetime import datetime as _dt, timezone as _tz
-                                event_start = _dt.fromisoformat(ev.start)
-                                opens_at = event_start - timedelta(minutes=reg.too_soon_minutes)
-                                ws.registration_opens_at_dt = opens_at
-                                ws.registration_opens_at_display = opens_at.strftime("%a %b %d, %I:%M %p")
-                                now = _dt.now(tz=opens_at.tzinfo or _tz.utc)
-                                delta = (opens_at - now).total_seconds()
-                                if delta > 0:
-                                    countdown = scheduler._format_countdown(delta)
-                                    st.success(
-                                        f"SNIPE QUEUED — auto-register at **{ws.registration_opens_at_display}** "
-                                        f"(in {countdown}). Start the engine to activate."
-                                    )
-                                else:
-                                    st.success("Queued — registration is already open! Start the engine.")
-                            except Exception:
-                                st.success("Queued. Start the engine to activate.")
-                        elif reg and not reg.register_disabled:
-                            st.success("Registration is OPEN — start the engine to register immediately!")
+                reg = api.get_event_registration(session, ev.event_id)
+                if reg and reg.too_soon_minutes and ev.start:
+                    try:
+                        from datetime import datetime as _dt, timezone as _tz
+                        event_start = _dt.fromisoformat(ev.start)
+                        opens_at = event_start - timedelta(minutes=reg.too_soon_minutes)
+                        ws.registration_opens_at_dt = opens_at
+                        ws.registration_opens_at_display = opens_at.strftime("%a %b %d, %I:%M %p")
+                        now = _dt.now(tz=opens_at.tzinfo or _tz.utc)
+                        delta = (opens_at - now).total_seconds()
+                        if delta > 0:
+                            countdown = scheduler._format_countdown(delta)
+                            st.success(
+                                f"SNIPE QUEUED — auto-register at **{ws.registration_opens_at_display}** "
+                                f"(in {countdown}). Start the engine to activate."
+                            )
                         else:
-                            st.success("Queued. Start the engine to activate.")
+                            st.success("Queued — registration is already open! Start the engine.")
+                    except Exception:
+                        st.success("Queued. Start the engine to activate.")
+                elif reg and not reg.register_disabled:
+                    st.success("Registration is OPEN — start the engine to register immediately!")
+                else:
+                    st.success("Queued. Start the engine to activate.")
 
 
 # ===================================================================
