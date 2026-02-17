@@ -463,6 +463,9 @@ class LifetimeAPI:
         Returns: "registered", "waitlisted", or "unknown"
         """
         try:
+            # Brief pause to let the server update its state after registration
+            time.sleep(1)
+
             reg = self.get_event_registration(session, event_id)
             if not reg:
                 return "unknown"
@@ -470,16 +473,26 @@ class LifetimeAPI:
             registered_ids = {int(m.get("id", 0)) for m in reg.registered_members}
             all_registered = all(mid in registered_ids for mid in member_ids)
 
+            log.debug(
+                "Verification: member_ids=%s registered_ids=%s all_registered=%s "
+                "has_spots=%s cta='%s' totalWaitlisted=%s",
+                member_ids, registered_ids, all_registered,
+                reg.has_spots, reg.register_cta_text, reg.total_waitlisted,
+            )
+
             if all_registered:
                 return "registered"
 
-            # Check CTA text for waitlist indicators
+            # Only trust explicit waitlist CTA actions (e.g. "Leave Waitlist")
             cta_lower = reg.register_cta_text.lower()
-            if any(kw in cta_lower for kw in ["waitlist", "wait list", "leave wait"]):
+            if any(kw in cta_lower for kw in ["leave wait", "on waitlist", "waitlisted"]):
                 return "waitlisted"
 
-            # If no spots and member isn't in registered list, likely waitlisted
-            if not reg.has_spots and not all_registered:
+            # Only conclude waitlisted if the member is actually on the waitlist
+            # (totalWaitlisted > 0 and member NOT in registered list).
+            # Previously this also checked `has_spots`, which caused false
+            # positives when we grabbed the last spot.
+            if reg.total_waitlisted > 0 and not all_registered:
                 return "waitlisted"
 
             return "unknown"
@@ -636,14 +649,23 @@ class LifetimeAPI:
         msg2 = data2.get("message", "") or data2.get("error", "") or ""
         full_resp_text = resp2.text[:500] if resp2.text else ""
 
-        # Check for waitlist indicators anywhere in the response
+        # Check for waitlist indicators in human-readable message fields only.
+        # IMPORTANT: Do NOT scan the raw JSON response text — field names like
+        # "hasWaitlist" or "totalWaitlisted" cause false positives.
         waitlist_keywords = ["waitlist", "wait list", "waiting list", "added to wait", "join wait"]
-        is_waitlisted = any(kw in full_resp_text.lower() for kw in waitlist_keywords)
+        waitlist_check_texts = [
+            msg2.lower(),
+            str(data2.get("notification", "")).lower(),
+            str(data2.get("status", "")).lower(),
+        ]
+        # Also check step 1 message/notification fields
+        step1_notification = str(validation.get("notification", "")).lower()
+        step1_message = str(data.get("message", "")).lower() if isinstance(data, dict) else ""
+        waitlist_check_texts.extend([step1_notification, step1_message])
 
-        # Also check step 1 (create) response for waitlist clues
-        step1_text = str(data).lower()
-        if any(kw in step1_text for kw in waitlist_keywords):
-            is_waitlisted = True
+        is_waitlisted = any(
+            kw in text for text in waitlist_check_texts for kw in waitlist_keywords
+        )
 
         if resp2.ok:
             if is_waitlisted:
