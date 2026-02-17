@@ -390,7 +390,71 @@ def page_schedule():
 
     st.divider()
 
-    for i, ev in enumerate(events):
+    # -- Filters --
+    import re as _re
+
+    def _extract_level(title: str) -> str:
+        """Pull a skill-level tag like '3.0-3.5' or '4.0+' from the title."""
+        m = _re.search(r'(\d\.\d\s*[-–]\s*\d\.\d\+?)', title)
+        if m:
+            return m.group(1).replace(" ", "")
+        m = _re.search(r'(\d\.\d\+?)', title)
+        if m:
+            return m.group(1)
+        return ""
+
+    DRILL_KEYWORDS = ["drill", "clinic", "lesson", "training", "skills"]
+    def _is_drill(title: str) -> bool:
+        t = title.lower()
+        return any(kw in t for kw in DRILL_KEYWORDS)
+
+    def _session_type(title: str) -> str:
+        t = title.lower()
+        if any(kw in t for kw in DRILL_KEYWORDS):
+            return "Drill / Clinic"
+        if "round robin" in t:
+            return "Round Robin"
+        if "league" in t:
+            return "League"
+        if "tournament" in t or "tourney" in t:
+            return "Tournament"
+        if "open play" in t or "open rec" in t:
+            return "Open Play"
+        return "Other"
+
+    # Build unique filter values from the loaded events
+    all_levels = sorted({_extract_level(ev.title) for ev in events} - {""})
+    all_types = sorted({_session_type(ev.title) for ev in events})
+
+    fc1, fc2 = st.columns(2)
+    with fc1:
+        selected_levels = st.multiselect(
+            "Filter by level",
+            options=all_levels,
+            default=[],
+            help="Leave empty to show all levels.",
+        )
+    with fc2:
+        selected_types = st.multiselect(
+            "Filter by session type",
+            options=all_types,
+            default=[],
+            help="Leave empty to show all types. 'Drill / Clinic' includes drills, clinics, lessons, etc.",
+        )
+
+    # Apply filters
+    filtered_events = events
+    if selected_levels:
+        filtered_events = [ev for ev in filtered_events if _extract_level(ev.title) in selected_levels]
+    if selected_types:
+        filtered_events = [ev for ev in filtered_events if _session_type(ev.title) in selected_types]
+
+    if len(filtered_events) != len(events):
+        st.caption(f"Showing **{len(filtered_events)}** of {len(events)} events")
+
+    st.divider()
+
+    for i, ev in enumerate(filtered_events):
         col1, col2 = st.columns([5, 3])
         # Show club name for multi-club searches
         club_tag = f" — *{ev.club or ev.location}*" if ev.club or ev.location else ""
@@ -401,7 +465,7 @@ def page_schedule():
 
         with col2:
             # Check registration status
-            if st.button("Check Availability", key=f"check_{i}"):
+            if st.button("Check Availability", key=f"check_{ev.event_id}"):
                 reg = api.get_event_registration(session, ev.event_id)
                 if reg:
                     if reg.has_spots:
@@ -445,7 +509,7 @@ def page_schedule():
                 else:
                     st.error("Could not fetch availability. Try reloading the schedule.")
 
-            if st.button("Add to Watchlist", key=f"watch_{i}"):
+            if st.button("Add to Watchlist", key=f"watch_{ev.event_id}"):
                 if not selected_member_ids:
                     st.error("Select at least one member above.")
                 else:
@@ -453,7 +517,7 @@ def page_schedule():
                     names = selected_member_labels if selected_member_labels else selected_member_ids
                     st.success(f"Watching **{ev.title}** for {names}")
 
-            if st.button("Register NOW", key=f"reg_{i}"):
+            if st.button("Register NOW", key=f"reg_{ev.event_id}"):
                 if not selected_member_ids:
                     st.error("Select at least one member above.")
                 else:
@@ -484,7 +548,7 @@ def page_schedule():
                             st.error(f"Registration error: {exc}")
 
             # Auto-Register (Snipe) — adds to watchlist with snipe scheduling
-            if st.button("Auto-Register (Snipe)", key=f"snipe_{i}"):
+            if st.button("Auto-Register (Snipe)", key=f"snipe_{ev.event_id}"):
                 if not selected_member_ids:
                     st.error("Select at least one member above.")
                 else:
