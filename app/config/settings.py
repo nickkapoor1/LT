@@ -1,11 +1,11 @@
 """
 Application-wide settings, paths, and defaults.
-
-Edit the values here to match your Lifetime Fitness club and preferences.
 """
 
-import os
+import re
 from pathlib import Path
+
+import requests
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -17,70 +17,113 @@ DATA_DIR.mkdir(exist_ok=True)
 ACCOUNTS_FILE = DATA_DIR / "accounts.enc"    # Encrypted account store
 KEY_FILE = DATA_DIR / ".key"                 # Fernet encryption key
 LOG_FILE = DATA_DIR / "activity.log"
-SESSION_DIR = DATA_DIR / "sessions"          # Playwright persistent contexts
-SESSION_DIR.mkdir(exist_ok=True)
 
 # ---------------------------------------------------------------------------
-# Lifetime Fitness base URLs
+# Lifetime Fitness API endpoints  (reverse-engineered from their website JS)
 # ---------------------------------------------------------------------------
-BASE_URL = "https://my.lifetime.life"
-LOGIN_URL = f"{BASE_URL}/login"
+API_BASE = "https://api.lifetimefitness.com"
 
-# Club schedule URL template — replace {club_slug} at runtime.
-# Example slug: "johns-creek"  →  .../clubs/johns-creek/classes.html
-SCHEDULE_URL_TEMPLATE = f"{BASE_URL}/clubs/{{club_slug}}/classes.html"
+# Authentication
+AUTH_URL = f"{API_BASE}/auth/v2/login"
+PROFILE_URL = f"{API_BASE}/user-profile/profile"
+
+# Schedule / Events
+EVENTS_URL = f"{API_BASE}/ux/web-schedules/v2/events"
+EVENT_DETAIL_URL = f"{API_BASE}/ux/web-schedules/v2/events/{{event_id}}"
+EVENT_REGISTRATION_URL = f"{API_BASE}/ux/web-schedules/v2/events/{{event_id}}/registration"
+
+# My Reservations (existing bookings)
+RESERVATIONS_URL = f"{API_BASE}/ux/web-schedules/v3/reservations"
+
+# Registration actions
+REG_CREATE_URL = f"{API_BASE}/sys/registrations/V3/ux/event"
+REG_GET_URL = f"{API_BASE}/sys/registrations/V3/ux/event/{{reg_id}}"
+REG_COMPLETE_URL = f"{API_BASE}/sys/registrations/V3/ux/event/{{reg_id}}/complete"
+REG_EXTEND_URL = f"{API_BASE}/sys/registrations/V3/ux/event/{{reg_id}}/extend"
+REG_CANCEL_URL = f"{API_BASE}/sys/registrations/V3/ux/event/{{reg_id}}/cancel"
+REG_ATTENDEE_URL = f"{API_BASE}/sys/registrations/V3/ux/event/{{reg_id}}/attendees/{{attendee_id}}"
+
+# Page for dynamic API key scraping
+LT_HOMEPAGE = "https://my.lifetime.life/"
 
 # ---------------------------------------------------------------------------
-# Common club slugs  (add yours here so the dropdown is pre-populated)
+# API keys — fetched dynamically from the Lifetime website.
+# The website embeds these in a JS config object on every page.
+# We cache them so we don't re-fetch on every call.
 # ---------------------------------------------------------------------------
-CLUB_SLUGS: dict[str, str] = {
-    "Alpharetta": "alpharetta",
-    "Johns Creek": "johns-creek",
-    "Buckhead": "buckhead",
-    "Centennial": "centennial",
-    "Duluth": "duluth",
-    "Peachtree Corners": "peachtree-corners",
-    "Sugarloaf": "sugarloaf",
-    "Woodstock": "woodstock",
-    "Brookhaven": "brookhaven",
-    "Flower Mound": "flower-mound",
-    "Frisco": "frisco",
-    "Plano": "plano",
-    "Scottsdale": "scottsdale",
-    "Gilbert": "gilbert",
-    "Tempe": "tempe",
-    "Edina": "edina",
-    "Plymouth": "plymouth",
-    "St. Louis Park": "st-louis-park",
-    "Bloomington South": "bloomington-south",
-    "Fridley": "fridley",
-    "Custom (enter slug below)": "",
+_cached_apim_key: str | None = None
+_cached_myaccount_key: str | None = None
+
+
+def fetch_api_keys(force: bool = False) -> tuple[str, str]:
+    """
+    Scrape the two API keys from the Lifetime homepage JS config.
+
+    Returns (apim_key, myaccount_key).
+    """
+    global _cached_apim_key, _cached_myaccount_key
+    if not force and _cached_apim_key and _cached_myaccount_key:
+        return _cached_apim_key, _cached_myaccount_key
+
+    resp = requests.get(LT_HOMEPAGE, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
+    resp.raise_for_status()
+    html = resp.text
+
+    m1 = re.search(r'"apimKey"\s*:\s*"([a-f0-9]{32})"', html)
+    m2 = re.search(r'"ltMyAccountApiKey"\s*:\s*"([A-Za-z0-9]{32})"', html)
+    if not m1 or not m2:
+        raise RuntimeError("Failed to extract API keys from Lifetime homepage. Site may have changed.")
+
+    _cached_apim_key = m1.group(1)
+    _cached_myaccount_key = m2.group(1)
+    return _cached_apim_key, _cached_myaccount_key
+
+
+# ---------------------------------------------------------------------------
+# Club locations — the API uses the display name (e.g. "PENN 1"), not a slug.
+# Add your clubs here for the dropdown.
+# ---------------------------------------------------------------------------
+CLUBS: dict[str, int] = {
+    # Format: "Display Name": clubId
+    "PENN 1": 351,
+    "Sky (Manhattan)": 250,
+    "23rd Street": 364,
+    "Atlantic Avenue": 327,
+    "Battery Park": 331,
+    "Brooklyn Tower": 380,
+    "Bryant Park": 367,
+    "Dumbo": 363,
+    "Fifth Avenue": 389,
+    "Midtown": 320,
+    "NoHo": 345,
+    "One Wall Street": 362,
+    "Alpharetta": 114,
+    "Buckhead": 119,
+    "Johns Creek": 184,
+    "Peachtree Corners": 120,
+    "Sugarloaf": 156,
+    "Woodstock": 137,
+    "Flower Mound": 141,
+    "Frisco": 158,
+    "Plano": 104,
+    "Scottsdale": 143,
+    "Gilbert": 147,
+    "Edina": 8,
+    "Plymouth": 7,
+    "St. Louis Park": 3,
 }
-
-# ---------------------------------------------------------------------------
-# Session types to look for when scraping (case-insensitive match)
-# ---------------------------------------------------------------------------
-SESSION_TYPES: list[str] = [
-    "Pickleball Open Play",
-    "Pickleball Court Reservation",
-    "Pickleball Clinic",
-    "Pickleball League",
-    "Pickleball Skills & Drills",
-    "Pickleball",
-]
 
 # ---------------------------------------------------------------------------
 # Polling / automation defaults
 # ---------------------------------------------------------------------------
-DEFAULT_POLL_INTERVAL_SEC = 30        # seconds between availability checks
-MIN_POLL_INTERVAL_SEC = 10
+DEFAULT_POLL_INTERVAL_SEC = 5         # seconds between checks during snipe window
+MIN_POLL_INTERVAL_SEC = 1
 MAX_POLL_INTERVAL_SEC = 300
-MAX_RETRY_ATTEMPTS = 3                # retries per registration attempt
-RETRY_DELAY_SEC = 2                   # base delay between retries (exponential)
+MAX_RETRY_ATTEMPTS = 5                # retries per registration attempt
+RETRY_DELAY_SEC = 0.5                 # very fast retries for sniping
 
 # ---------------------------------------------------------------------------
-# Playwright settings
+# Snipe timing
 # ---------------------------------------------------------------------------
-HEADLESS = True                       # Set False to watch the browser work
-BROWSER_TIMEOUT_MS = 30_000           # 30 s page-load / action timeout
-SLOW_MO_MS = 0                        # ms delay between Playwright actions (debug aid)
+# How many seconds BEFORE a registration window opens to start rapid polling.
+SNIPE_LEAD_TIME_SEC = 30

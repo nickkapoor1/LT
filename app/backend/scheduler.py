@@ -1,13 +1,13 @@
 """
-Background scheduler — runs the polling loop in a separate thread so the
-Streamlit UI stays responsive.
+Background scheduler — runs the polling loop in a separate thread.
 
-The scheduler:
-1. Iterates over all pending watched sessions.
-2. For each account, ensures the session is still logged in.
-3. Re-scrapes availability for each watched session.
-4. If a session is open, hands it to the registrar.
-5. Sleeps for the configured polling interval, then repeats.
+For each pending watched event:
+1. Checks registration availability via the API.
+2. If spots are open (or waitlist available), fires the registration call.
+3. Logs results to the activity feed.
+
+Designed for "sniping" — when registration opens at a precise time, the
+loop polls rapidly and registers the instant availability appears.
 """
 
 from __future__ import annotations
@@ -15,14 +15,12 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
 
+from app.backend.api_client import LifetimeAPI
 from app.backend.crypto import load_accounts
-from app.backend.login import LoginManager
-from app.backend.monitor import Monitor, WatchedSession
-from app.backend.registrar import register_for_session
-from app.backend.scraper import scrape_schedule
+from app.backend.monitor import Monitor, WatchedEvent
 from app.config import settings
 
 log = logging.getLogger(__name__)
@@ -30,29 +28,13 @@ log = logging.getLogger(__name__)
 
 @dataclass
 class LogEntry:
-    """A single line in the activity log."""
     timestamp: str
     account: str
     message: str
-    level: str = "info"  # info | warning | error | success
+    level: str = "info"
 
 
 class Scheduler:
-    """
-    Manages the background automation loop.
-
-    Attributes
-    ----------
-    monitor : Monitor
-        Shared monitor that tracks watched sessions.
-    poll_interval : int
-        Seconds between polling cycles.
-    running : bool
-        Whether the loop is active.
-    activity_log : list[LogEntry]
-        Recent activity entries (displayed in the Streamlit dashboard).
-    """
-
     def __init__(self, monitor: Monitor) -> None:
         self.monitor = monitor
         self.poll_interval: int = settings.DEFAULT_POLL_INTERVAL_SEC
@@ -60,142 +42,138 @@ class Scheduler:
 
         self._thread: threading.Thread | None = None
         self._stop_event = threading.Event()
-        self._login_mgr = LoginManager()
+        self._api = LifetimeAPI()
         self._lock = threading.Lock()
 
-        # Bounded in-memory log (most recent first)
         self.activity_log: list[LogEntry] = []
         self._max_log = 500
 
     # ------------------------------------------------------------------
-    # Public control
+    # Control
     # ------------------------------------------------------------------
 
     def start(self) -> None:
-        """Start the polling loop in a background thread."""
         if self.running:
             return
         self._stop_event.clear()
-        self._login_mgr.start()
         self.running = True
         self._thread = threading.Thread(target=self._loop, daemon=True, name="scheduler")
         self._thread.start()
-        self._log_activity("system", "Scheduler started.", level="info")
+        self._log("system", "Scheduler started (polling every {}s).".format(self.poll_interval))
 
     def stop(self) -> None:
-        """Signal the loop to stop and wait for it to finish."""
         if not self.running:
             return
         self._stop_event.set()
         self.running = False
         if self._thread and self._thread.is_alive():
-            self._thread.join(timeout=15)
-        self._login_mgr.stop()
-        self._log_activity("system", "Scheduler stopped.", level="info")
+            self._thread.join(timeout=10)
+        self._log("system", "Scheduler stopped.")
 
     # ------------------------------------------------------------------
-    # Main loop
+    # Loop
     # ------------------------------------------------------------------
 
     def _loop(self) -> None:
-        log.info("Scheduler loop started (interval=%ds).", self.poll_interval)
         while not self._stop_event.is_set():
             try:
                 self._poll_cycle()
             except Exception as exc:
                 log.error("Scheduler cycle error: %s", exc)
-                self._log_activity("system", f"Cycle error: {exc}", level="error")
+                self._log("system", f"Cycle error: {exc}", "error")
 
-            # Sleep in small increments so we can stop promptly
+            # Sleep in 1-second ticks so we can stop promptly
             for _ in range(self.poll_interval):
                 if self._stop_event.is_set():
                     break
                 time.sleep(1)
 
-        log.info("Scheduler loop exited.")
-
     def _poll_cycle(self) -> None:
-        """One full polling cycle across all pending watched sessions."""
         pending = self.monitor.pending()
         if not pending:
             return
 
         # Group by account
-        accounts_map: dict[str, list[WatchedSession]] = {}
+        by_account: dict[str, list[WatchedEvent]] = {}
         for ws in pending:
-            accounts_map.setdefault(ws.account_email, []).append(ws)
+            by_account.setdefault(ws.account_email, []).append(ws)
 
-        # Load credentials
         all_accounts = {a["email"].lower(): a for a in load_accounts()}
 
-        for email, watched_list in accounts_map.items():
+        for email, watched_list in by_account.items():
             acct = all_accounts.get(email.lower())
             if not acct:
-                self._log_activity(email, "Account not found in credential store — skipping.", level="error")
-                continue
-            if not acct.get("enabled", True):
+                self._log(email, "Account not found — skipping.", "error")
                 continue
 
-            # Ensure logged in
-            if not self._login_mgr.ensure_logged_in(acct["email"], acct["password"]):
-                self._log_activity(email, "Login failed — will retry next cycle.", level="error")
+            session = self._api.ensure_authenticated(acct["email"], acct["password"])
+            if not session.authenticated:
+                self._log(email, "Login failed — will retry next cycle.", "error")
                 continue
-
-            page = self._login_mgr.page_for(email)
 
             for ws in watched_list:
                 if self._stop_event.is_set():
                     return
+                self._process_event(session, ws, acct)
 
-                self._log_activity(email, f"Checking: {ws.session.name} on {ws.session.date} …")
+    def _process_event(self, session, ws: WatchedEvent, acct: dict) -> None:
+        email = ws.account_email
 
-                # Re-scrape just this date to get fresh availability
-                fresh = scrape_schedule(
-                    page,
-                    acct["club_slug"],
-                    target_date=ws.session.date,
-                    session_types=[ws.session.name],
-                )
+        # Check registration status for this event
+        reg_info = self._api.get_event_registration(session, ws.event.event_id)
+        if reg_info is None:
+            self.monitor.mark_checked(ws, "API error")
+            self._log(email, f"Failed to check {ws.event.title}", "error")
+            return
 
-                # Find the matching session in fresh data
-                match = None
-                for s in fresh:
-                    if s.name == ws.session.name and s.time == ws.session.time:
-                        match = s
-                        break
+        # Build a status string
+        if reg_info.has_spots:
+            status = f"{reg_info.remaining_spots} spots open"
+        elif reg_info.has_waitlist:
+            status = f"Full (waitlist: {reg_info.total_waitlisted})"
+        else:
+            status = "Closed"
 
-                if match is None:
-                    self.monitor.mark_checked(ws, "not found")
-                    self._log_activity(email, f"Session not found on page — may have been removed.", level="warning")
-                    continue
+        self.monitor.mark_checked(ws, status)
 
-                self.monitor.mark_checked(ws, match.availability)
+        # Check if member is already registered
+        registered_ids = {m.get("id") for m in reg_info.registered_members}
+        target_ids = ws.member_ids
+        already_registered = all(mid in registered_ids for mid in target_ids)
+        if already_registered:
+            self.monitor.mark_registered(ws)
+            self._log(email, f"Already registered for {ws.event.title}!", "success")
+            return
 
-                if not match.is_open():
-                    self._log_activity(email, f"Not open yet ({match.availability}). Will retry.")
-                    continue
+        # If registration is disabled (too soon), just log and wait
+        if reg_info.register_disabled:
+            if reg_info.registration_opens_at:
+                self._log(email, f"{ws.event.title}: {reg_info.registration_opens_at}")
+            else:
+                self._log(email, f"{ws.event.title}: Registration not yet open.")
+            return
 
-                # Attempt registration
-                self._log_activity(email, f"Session OPEN — attempting registration …", level="info")
-                result = register_for_session(page, match.url or ws.session.url, email)
+        # Attempt registration
+        self._log(email, f"Attempting registration for {ws.event.title} …")
+        result = self._api.register(session, ws.event.event_id, target_ids)
 
-                if result.success:
-                    self.monitor.mark_registered(ws)
-                    self._log_activity(email, f"Registered for {ws.session.name}!", level="success")
-                elif result.waitlisted:
-                    self.monitor.mark_waitlisted(ws)
-                    self._log_activity(email, f"Waitlisted for {ws.session.name}.", level="warning")
-                else:
-                    self.monitor.mark_failed(ws, result.message)
-                    self._log_activity(email, f"Registration failed: {result.message}", level="error")
+        if result.success:
+            self.monitor.mark_registered(ws)
+            self._log(email, f"REGISTERED for {ws.event.title}!", "success")
+        elif result.waitlisted:
+            self.monitor.mark_waitlisted(ws)
+            self._log(email, f"Waitlisted for {ws.event.title}.", "warning")
+        else:
+            # Don't mark as permanently failed — keep retrying
+            self._log(email, f"Registration attempt failed: {result.message}", "warning")
 
     # ------------------------------------------------------------------
     # Activity log
     # ------------------------------------------------------------------
 
-    def _log_activity(self, account: str, message: str, level: str = "info") -> None:
+    def _log(self, account: str, message: str, level: str = "info") -> None:
         entry = LogEntry(
-            timestamp=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            timestamp=datetime.now().strftime("%H:%M:%S"),
             account=account,
             message=message,
             level=level,
@@ -203,12 +181,10 @@ class Scheduler:
         with self._lock:
             self.activity_log.insert(0, entry)
             if len(self.activity_log) > self._max_log:
-                self.activity_log = self.activity_log[: self._max_log]
-
-        # Also write to file
+                self.activity_log = self.activity_log[:self._max_log]
         try:
             with open(settings.LOG_FILE, "a") as f:
-                f.write(f"[{entry.timestamp}] [{entry.level.upper()}] [{account}] {message}\n")
+                f.write(f"[{entry.timestamp}] [{level.upper()}] [{account}] {message}\n")
         except Exception:
             pass
 

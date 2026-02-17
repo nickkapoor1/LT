@@ -14,29 +14,17 @@ from pathlib import Path
 
 import streamlit as st
 
-# ---------------------------------------------------------------------------
-# Ensure the project root is on sys.path so "app.*" imports work when
-# Streamlit is launched from the project directory.
-# ---------------------------------------------------------------------------
+# Ensure project root on path
 PROJECT_ROOT = Path(__file__).resolve().parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from app.backend.api_client import LifetimeAPI, Event
 from app.backend.crypto import add_account, load_accounts, remove_account, save_accounts
 from app.backend.monitor import Monitor
 from app.backend.scheduler import Scheduler
-from app.backend.scraper import Session
-from app.config.settings import (
-    CLUB_SLUGS,
-    DEFAULT_POLL_INTERVAL_SEC,
-    MAX_POLL_INTERVAL_SEC,
-    MIN_POLL_INTERVAL_SEC,
-    SESSION_TYPES,
-)
+from app.config.settings import CLUBS, DEFAULT_POLL_INTERVAL_SEC, MIN_POLL_INTERVAL_SEC, MAX_POLL_INTERVAL_SEC
 
-# ---------------------------------------------------------------------------
-# Logging setup (once)
-# ---------------------------------------------------------------------------
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
@@ -44,365 +32,342 @@ logging.basicConfig(
 )
 
 # ---------------------------------------------------------------------------
-# Streamlit page config
+# Page config
 # ---------------------------------------------------------------------------
-st.set_page_config(
-    page_title="Pickleball Auto-Register",
-    page_icon="🏓",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
+st.set_page_config(page_title="Pickleball Sniper", page_icon="🏓", layout="wide")
 
 # ---------------------------------------------------------------------------
-# Persistent objects stored in Streamlit session state so they survive reruns.
+# Persistent state
 # ---------------------------------------------------------------------------
 if "monitor" not in st.session_state:
     st.session_state.monitor = Monitor()
-
 if "scheduler" not in st.session_state:
     st.session_state.scheduler = Scheduler(st.session_state.monitor)
-
-if "scraped_sessions" not in st.session_state:
-    st.session_state.scraped_sessions: list[dict] = []
+if "api" not in st.session_state:
+    st.session_state.api = LifetimeAPI()
+if "events" not in st.session_state:
+    st.session_state.events: list[Event] = []
 
 monitor: Monitor = st.session_state.monitor
 scheduler: Scheduler = st.session_state.scheduler
+api: LifetimeAPI = st.session_state.api
 
+# ---------------------------------------------------------------------------
+# Sidebar
+# ---------------------------------------------------------------------------
+st.sidebar.title("Pickleball Sniper")
+page = st.sidebar.radio("Navigate", ["Dashboard", "Accounts", "Schedule", "Settings"])
 
-# ===================================================================
-# SIDEBAR — Navigation
-# ===================================================================
-st.sidebar.title("Pickleball Auto-Register")
-page = st.sidebar.radio(
-    "Navigate",
-    ["Dashboard", "Accounts", "Schedule", "Settings"],
-    index=0,
-)
-
-# Engine controls in sidebar
 st.sidebar.markdown("---")
-st.sidebar.subheader("Engine Controls")
-
 if scheduler.running:
-    st.sidebar.success("Engine is RUNNING")
+    st.sidebar.success("Engine RUNNING")
     if st.sidebar.button("Stop Engine", type="primary", use_container_width=True):
         scheduler.stop()
         st.rerun()
 else:
-    st.sidebar.warning("Engine is STOPPED")
+    st.sidebar.warning("Engine STOPPED")
     if st.sidebar.button("Start Engine", type="primary", use_container_width=True):
         accounts = load_accounts()
+        pending = monitor.pending()
         if not accounts:
             st.sidebar.error("Add at least one account first.")
-        elif not monitor.pending():
-            st.sidebar.error("Select at least one session to watch first.")
+        elif not pending:
+            st.sidebar.error("Add sessions to your watchlist first.")
         else:
             scheduler.start()
             st.rerun()
 
-st.sidebar.markdown("---")
 st.sidebar.caption(
-    "Polling every **{}s** · {} account(s) · {} watched session(s)".format(
-        scheduler.poll_interval,
-        len(load_accounts()),
-        len(monitor.all_watched()),
+    "Polling: **{}s** | {} account(s) | {} watched".format(
+        scheduler.poll_interval, len(load_accounts()), len(monitor.all_watched()),
     )
 )
 
 
 # ===================================================================
-# PAGE: Dashboard
+# DASHBOARD
 # ===================================================================
-def page_dashboard() -> None:
+def page_dashboard():
     st.header("Dashboard")
 
-    accounts = load_accounts()
     watched = monitor.all_watched()
-
-    # --- Metrics row ---
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Accounts", len(accounts))
-    c2.metric("Watched Sessions", len(watched))
+    c1.metric("Accounts", len(load_accounts()))
+    c2.metric("Watching", len(watched))
     c3.metric("Registered", sum(1 for w in watched if w.registration_status == "registered"))
     c4.metric("Engine", "Running" if scheduler.running else "Stopped")
 
-    # --- Watched sessions table ---
-    st.subheader("Watched Sessions")
+    # Watched events
+    st.subheader("Watched Events")
     if not watched:
-        st.info("No sessions being watched yet. Go to **Schedule** to add some.")
+        st.info("Go to **Schedule** to find events and add them to your watchlist.")
     else:
         for ws in watched:
-            status_icon = {
-                "pending": "🔵",
-                "registered": "✅",
-                "waitlisted": "🟡",
-                "failed": "🔴",
-            }.get(ws.registration_status, "⚪")
+            icon = {"pending": "🔵", "registered": "✅", "waitlisted": "🟡", "failed": "🔴"}.get(
+                ws.registration_status, "⚪"
+            )
+            col1, col2, col3 = st.columns([5, 3, 2])
+            col1.markdown(f"{icon} **{ws.event.title}**")
+            col1.caption(f"{ws.event.display_time()} | {ws.event.location}")
+            col2.write(f"Account: {ws.account_email}")
+            col2.write(f"Status: **{ws.registration_status}** | Last: {ws.last_status or '—'} ({ws.last_checked or 'never'})")
+            col2.write(f"Members: {ws.member_ids}")
 
-            with st.expander(
-                f"{status_icon} {ws.session.name} — {ws.session.date} {ws.session.time}  |  {ws.account_email}",
-                expanded=False,
-            ):
-                col1, col2 = st.columns(2)
-                col1.write(f"**Account:** {ws.account_email}")
-                col1.write(f"**Status:** {ws.registration_status}")
-                col2.write(f"**Last checked:** {ws.last_checked or 'never'}")
-                col2.write(f"**Availability:** {ws.last_status or 'unknown'}")
-
-                bcol1, bcol2 = st.columns(2)
-                if ws.registration_status in ("failed", "waitlisted"):
-                    if bcol1.button("Retry", key=f"retry_{ws.key}"):
-                        monitor.reset_status(ws)
-                        st.rerun()
-                if bcol2.button("Remove", key=f"remove_{ws.key}"):
-                    monitor.unwatch(ws.session, ws.account_email)
+            btn_col1, btn_col2 = col3.columns(2)
+            if ws.registration_status in ("failed", "waitlisted"):
+                if btn_col1.button("Retry", key=f"retry_{ws.key}"):
+                    monitor.reset_status(ws)
                     st.rerun()
+            if btn_col2.button("Remove", key=f"rm_{ws.key}"):
+                monitor.unwatch(ws.event.event_id, ws.account_email)
+                st.rerun()
+            st.divider()
 
-    # --- Activity log ---
+    # Activity log
     st.subheader("Activity Log")
-    log_entries = scheduler.get_recent_log(30)
+    log_entries = scheduler.get_recent_log(40)
     if not log_entries:
-        st.caption("No activity yet. Start the engine to begin monitoring.")
+        st.caption("No activity yet.")
     else:
         for entry in log_entries:
-            color = {
-                "success": "green",
-                "error": "red",
-                "warning": "orange",
-            }.get(entry.level, "gray")
+            color = {"success": "green", "error": "red", "warning": "orange"}.get(entry.level, "gray")
             st.markdown(
-                f"<span style='color:{color}'>[{entry.timestamp}]</span> "
+                f"<span style='color:{color};font-family:monospace'>[{entry.timestamp}]</span> "
                 f"**{entry.account}** — {entry.message}",
                 unsafe_allow_html=True,
             )
 
-    # Auto-refresh while engine is running
     if scheduler.running:
-        st.caption("Auto-refreshing every 10 seconds …")
-        import time
-        time.sleep(10)
+        st.caption("Auto-refreshing …")
+        import time; time.sleep(5)
         st.rerun()
 
 
 # ===================================================================
-# PAGE: Accounts
+# ACCOUNTS
 # ===================================================================
-def page_accounts() -> None:
+def page_accounts():
     st.header("Manage Accounts")
 
     accounts = load_accounts()
-
-    # --- Existing accounts ---
     if accounts:
         st.subheader(f"Stored Accounts ({len(accounts)})")
         for i, acct in enumerate(accounts):
-            with st.expander(f"{'✅' if acct.get('enabled', True) else '⏸️'}  {acct['email']}  —  {acct.get('club_name', '')}"):
-                st.write(f"**Club:** {acct.get('club_name', 'N/A')} (`{acct.get('club_slug', '')}`)")
-                st.write(f"**Session types:** {', '.join(acct.get('session_types', [])) or 'All pickleball'}")
-                st.write(f"**Enabled:** {acct.get('enabled', True)}")
+            enabled = acct.get("enabled", True)
+            with st.expander(f"{'✅' if enabled else '⏸️'}  {acct['email']}  —  {acct.get('club_name', '')}"):
+                st.write(f"**Club:** {acct.get('club_name', 'N/A')} (ID {acct.get('club_id', '?')})")
+                st.write(f"**Enabled:** {enabled}")
 
-                col1, col2, col3 = st.columns(3)
-                # Toggle enable/disable
-                if acct.get("enabled", True):
-                    if col1.button("Disable", key=f"disable_{i}"):
+                # Test login
+                if st.button("Test Login", key=f"test_{i}"):
+                    with st.spinner("Logging in …"):
+                        session = api.login(acct["email"], acct["password"])
+                        if session.authenticated:
+                            st.success(f"Login OK! Member: {session.member_name} (ID {session.member_id})")
+                        else:
+                            st.error("Login failed — check credentials.")
+
+                c1, c2, c3 = st.columns(3)
+                if enabled:
+                    if c1.button("Disable", key=f"dis_{i}"):
                         acct["enabled"] = False
                         save_accounts(accounts)
                         st.rerun()
                 else:
-                    if col1.button("Enable", key=f"enable_{i}"):
+                    if c1.button("Enable", key=f"en_{i}"):
                         acct["enabled"] = True
                         save_accounts(accounts)
                         st.rerun()
-
-                if col2.button("Remove", key=f"rm_{i}"):
+                if c2.button("Remove", key=f"del_{i}"):
                     remove_account(acct["email"])
-                    monitor.unwatch_all(acct["email"])
                     st.rerun()
     else:
-        st.info("No accounts yet. Add one below.")
+        st.info("No accounts yet.")
 
-    # --- Add new account ---
+    # Add account form
     st.subheader("Add New Account")
-    with st.form("add_account_form", clear_on_submit=True):
+    with st.form("add_account", clear_on_submit=True):
         email = st.text_input("Lifetime Email")
         password = st.text_input("Password", type="password")
-
-        club_name = st.selectbox("Club Location", list(CLUB_SLUGS.keys()))
-        custom_slug = ""
-        if club_name == "Custom (enter slug below)":
-            custom_slug = st.text_input(
-                "Custom club slug",
-                help="The URL slug for your club — e.g. 'johns-creek' from my.lifetime.life/clubs/johns-creek/classes.html",
-            )
-
-        session_types = st.multiselect(
-            "Session types to monitor",
-            SESSION_TYPES,
-            default=SESSION_TYPES[:2],
-            help="Leave empty to match all pickleball sessions.",
-        )
-
-        submitted = st.form_submit_button("Add Account")
-        if submitted:
+        club_name = st.selectbox("Club", list(CLUBS.keys()), index=0)
+        if st.form_submit_button("Add Account"):
             if not email or not password:
-                st.error("Email and password are required.")
+                st.error("Email and password required.")
             else:
-                slug = custom_slug if club_name == "Custom (enter slug below)" else CLUB_SLUGS[club_name]
-                if not slug:
-                    st.error("Please enter a club slug.")
-                else:
-                    add_account(email, password, slug, club_name, session_types)
-                    st.success(f"Account **{email}** saved.")
-                    st.rerun()
+                club_id = CLUBS[club_name]
+                add_account(email, password, str(club_id), club_name, [])
+                st.success(f"**{email}** added for **{club_name}**.")
+                st.rerun()
 
 
 # ===================================================================
-# PAGE: Schedule
+# SCHEDULE
 # ===================================================================
-def page_schedule() -> None:
+def page_schedule():
     st.header("Pickleball Schedule")
 
     accounts = load_accounts()
     if not accounts:
-        st.warning("Add at least one account in the **Accounts** tab first.")
+        st.warning("Add an account first.")
         return
 
-    # Controls
-    col1, col2, col3 = st.columns([2, 2, 1])
-    with col1:
-        acct_emails = [a["email"] for a in accounts if a.get("enabled", True)]
-        if not acct_emails:
-            st.warning("No enabled accounts.")
-            return
-        selected_email = st.selectbox("Use account", acct_emails)
+    enabled = [a for a in accounts if a.get("enabled", True)]
+    if not enabled:
+        st.warning("No enabled accounts.")
+        return
 
-    selected_acct = next(a for a in accounts if a["email"] == selected_email)
+    col1, col2, col3, col4 = st.columns([2, 2, 2, 1])
+    with col1:
+        selected_email = st.selectbox("Account", [a["email"] for a in enabled])
+    acct = next(a for a in enabled if a["email"] == selected_email)
 
     with col2:
-        target_date = st.date_input("Date", value=datetime.now().date())
-
+        start = st.date_input("From", value=datetime.now().date())
     with col3:
-        scrape_btn = st.button("Refresh Schedule", use_container_width=True)
+        end = st.date_input("To", value=datetime.now().date() + timedelta(days=7))
+    with col4:
+        fetch = st.button("Load Schedule", use_container_width=True)
 
-    # Scrape on button press
-    if scrape_btn:
-        with st.spinner("Logging in and scraping schedule …"):
-            try:
-                from app.backend.login import LoginManager
-                from app.backend.scraper import scrape_schedule
+    if fetch:
+        with st.spinner("Fetching schedule from Lifetime API …"):
+            session = api.ensure_authenticated(acct["email"], acct["password"])
+            if not session.authenticated:
+                st.error("Login failed.")
+                return
+            events = api.get_events(
+                session,
+                acct["club_name"],
+                start.strftime("%m/%d/%Y"),
+                end.strftime("%m/%d/%Y"),
+            )
+            st.session_state.events = events
+            st.session_state.schedule_email = selected_email
+            st.success(f"Found **{len(events)}** pickleball events.")
 
-                lm = LoginManager()
-                lm.start()
-                ok = lm.login(selected_acct["email"], selected_acct["password"])
-                if not ok:
-                    st.error("Login failed — check credentials.")
-                    lm.stop()
-                    return
+    events: list[Event] = st.session_state.get("events", [])
+    if not events:
+        st.caption("Click **Load Schedule** to fetch events.")
+        return
 
-                page = lm.page_for(selected_acct["email"])
-                sessions = scrape_schedule(
-                    page,
-                    selected_acct["club_slug"],
-                    target_date=target_date.isoformat(),
-                    session_types=selected_acct.get("session_types") or None,
-                )
-                lm.stop()
+    st.subheader(f"Events ({len(events)})")
 
-                st.session_state.scraped_sessions = [s.to_dict() for s in sessions]
-                st.session_state.scrape_account = selected_email
-                st.session_state.scrape_date = target_date.isoformat()
-                st.success(f"Found {len(sessions)} pickleball session(s).")
-            except Exception as exc:
-                st.error(f"Scrape error: {exc}")
+    # Get member IDs for registration selection
+    session = api.get_session(selected_email)
+    all_member_ids: list[int] = []
+    if session and session.member_id:
+        all_member_ids = [session.member_id]
 
-    # Display scraped sessions
-    sessions_data: list[dict] = st.session_state.get("scraped_sessions", [])
-    if sessions_data:
-        st.subheader(
-            f"Sessions for {st.session_state.get('scrape_date', '')} "
-            f"(via {st.session_state.get('scrape_account', '')})"
-        )
+    for i, ev in enumerate(events):
+        col1, col2 = st.columns([5, 3])
+        col1.markdown(f"**{ev.title}**")
+        col1.caption(f"{ev.display_time()}")
+        col1.caption(f"{ev.location}")
 
-        for i, sd in enumerate(sessions_data):
-            avail = sd.get("availability", "Unknown")
-            icon = "🟢" if "open" in avail.lower() or "spot" in avail.lower() else "🔴"
-
-            with st.container():
-                c1, c2, c3 = st.columns([4, 2, 2])
-                c1.markdown(f"**{icon} {sd['name']}**")
-                c1.caption(f"{sd['date']}  ·  {sd['time']}")
-                c2.write(f"Availability: **{avail}**")
-
-                # Let the user pick which accounts to watch this session for
-                watch_accounts = c3.multiselect(
-                    "Watch for",
-                    acct_emails,
-                    key=f"watch_accts_{i}",
-                    label_visibility="collapsed",
-                    placeholder="Select accounts …",
-                )
-                if c3.button("Add to watchlist", key=f"watch_{i}"):
-                    session_obj = Session(**sd)
-                    for em in watch_accounts:
-                        monitor.watch(session_obj, em, auto_register=True)
-                    if watch_accounts:
-                        st.success(f"Watching **{sd['name']}** for {len(watch_accounts)} account(s).")
+        with col2:
+            # Check registration status
+            if st.button("Check Availability", key=f"check_{i}"):
+                reg = api.get_event_registration(session, ev.event_id)
+                if reg:
+                    if reg.has_spots:
+                        st.success(f"{reg.remaining_spots} spot(s) available!")
+                    elif reg.has_waitlist:
+                        st.warning(f"Full — waitlist ({reg.total_waitlisted} waiting)")
                     else:
-                        st.warning("Select at least one account.")
+                        st.error("Closed")
 
-                st.divider()
-    else:
-        st.caption("Click **Refresh Schedule** to load sessions.")
+                    if reg.registration_opens_at:
+                        st.info(reg.registration_opens_at)
+
+                    # Show member eligibility
+                    for m in reg.unregistered_members:
+                        st.caption(f"Eligible: {m.get('name')} (ID {m.get('id')})")
+                    for m in reg.registered_members:
+                        st.caption(f"Already registered: {m.get('name')}")
+
+            if st.button("Add to Watchlist", key=f"watch_{i}"):
+                # Determine members to register
+                if session:
+                    reg = api.get_event_registration(session, ev.event_id)
+                    if reg and reg.unregistered_members:
+                        member_ids = [m["id"] for m in reg.unregistered_members]
+                    else:
+                        member_ids = [session.member_id] if session.member_id else []
+                else:
+                    member_ids = []
+
+                if member_ids:
+                    monitor.watch(ev, selected_email, member_ids)
+                    st.success(f"Watching **{ev.title}** for member(s) {member_ids}")
+                else:
+                    st.error("No eligible members found.")
+
+            if st.button("Register NOW", key=f"reg_{i}"):
+                if not session:
+                    st.error("Not logged in.")
+                else:
+                    reg = api.get_event_registration(session, ev.event_id)
+                    if reg and reg.unregistered_members:
+                        member_ids = [m["id"] for m in reg.unregistered_members]
+                    else:
+                        member_ids = [session.member_id]
+
+                    with st.spinner("Registering …"):
+                        result = api.register(session, ev.event_id, member_ids)
+                        if result.success:
+                            st.success(f"Registered! {result.message}")
+                        elif result.waitlisted:
+                            st.warning(f"Waitlisted: {result.message}")
+                        else:
+                            st.error(f"Failed: {result.message}")
+
+        st.divider()
 
 
 # ===================================================================
-# PAGE: Settings
+# SETTINGS
 # ===================================================================
-def page_settings() -> None:
+def page_settings():
     st.header("Settings")
 
     st.subheader("Polling Interval")
     new_interval = st.slider(
-        "Seconds between availability checks",
+        "Seconds between checks",
         min_value=MIN_POLL_INTERVAL_SEC,
         max_value=MAX_POLL_INTERVAL_SEC,
         value=scheduler.poll_interval,
-        step=5,
+        step=1,
     )
     if new_interval != scheduler.poll_interval:
         scheduler.poll_interval = new_interval
-        st.success(f"Polling interval set to **{new_interval}s**.")
+        st.success(f"Polling interval: **{new_interval}s**")
 
-    st.subheader("Browser Mode")
-    headless = st.toggle("Run browser in headless mode (invisible)", value=True)
     st.caption(
-        "Turn this OFF to watch the browser perform actions — useful for debugging. "
-        "Requires restarting the engine to take effect."
+        "For sniping (registering exactly when slots open), use 1-5 seconds. "
+        "For passive monitoring, use 30-60 seconds."
     )
-    # We store this but it only takes effect on next engine start
-    from app.config import settings as cfg
-    cfg.HEADLESS = headless
 
-    st.subheader("Watched Sessions")
+    st.subheader("Watchlist")
     watched = monitor.all_watched()
     if watched:
-        if st.button("Clear ALL watched sessions", type="secondary"):
+        st.write(f"{len(watched)} event(s) being watched.")
+        if st.button("Clear ALL watched events"):
             monitor.unwatch_all()
-            st.success("All watches cleared.")
+            st.success("Cleared.")
             st.rerun()
     else:
-        st.caption("No sessions being watched.")
+        st.caption("No events being watched.")
 
-    st.subheader("About")
+    st.subheader("How It Works")
     st.markdown(
         """
-        **Pickleball Auto-Register** automates session booking on the
-        Lifetime Fitness member portal using Playwright browser automation.
+        1. **Add your account** in the Accounts tab.
+        2. **Load the schedule** to see upcoming pickleball events.
+        3. **Add events to your watchlist** — pick the ones you want.
+        4. **Start the engine** — it polls the API every few seconds.
+        5. The moment registration opens, it fires the register call instantly.
 
-        - Credentials are encrypted at rest (AES-128 via Fernet).
-        - The automation runs in a background thread so this UI stays responsive.
-        - If Lifetime changes their website, update the selectors in
-          `app/config/selectors.py`.
+        This uses Lifetime's internal API directly — no browser automation.
+        Registration calls complete in milliseconds, not seconds.
         """
     )
 
