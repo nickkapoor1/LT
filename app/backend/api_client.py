@@ -34,6 +34,19 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 @dataclass
+class MemberInfo:
+    """A member on a Lifetime account (primary or family)."""
+    member_id: int = 0
+    name: str = ""
+    first_name: str = ""
+    last_name: str = ""
+    relationship: str = ""  # e.g. "primary", "spouse", "child"
+
+    def display_name(self) -> str:
+        return self.name or f"{self.first_name} {self.last_name}".strip() or f"Member {self.member_id}"
+
+
+@dataclass
 class AuthSession:
     """Stores authentication state for one Lifetime account."""
     email: str
@@ -44,11 +57,19 @@ class AuthSession:
     member_name: str = ""
     authenticated: bool = False
     last_auth: float = 0.0  # timestamp
+    # All members on the account (primary + family)
+    members: list[MemberInfo] = field(default_factory=list)
 
     def is_expired(self, max_age_sec: int = 3600) -> bool:
         if not self.authenticated:
             return True
         return (time.time() - self.last_auth) > max_age_sec
+
+    def get_all_member_ids(self) -> list[int]:
+        """Return all member IDs on this account."""
+        if self.members:
+            return [m.member_id for m in self.members]
+        return [self.member_id] if self.member_id else []
 
 
 @dataclass
@@ -171,11 +192,12 @@ class LifetimeAPI:
             session.authenticated = True
             session.last_auth = time.time()
 
-            # Fetch profile to get member IDs
+            # Fetch profile to get member IDs (primary + family)
             self._fetch_profile(session)
 
             self._sessions[email] = session
-            log.info("[%s] Login successful (member_id=%s).", email, session.member_id)
+            member_names = [m.display_name() for m in session.members] if session.members else [session.member_name]
+            log.info("[%s] Login successful. Members: %s", email, member_names)
             return session
 
         except Exception as exc:
@@ -193,7 +215,7 @@ class LifetimeAPI:
         return self._sessions.get(email)
 
     def _fetch_profile(self, session: AuthSession) -> None:
-        """Fetch member details from the profile endpoint."""
+        """Fetch member details from the profile endpoint, including family members."""
         try:
             resp = requests.get(
                 PROFILE_URL,
@@ -201,9 +223,51 @@ class LifetimeAPI:
                 timeout=15,
             )
             data = resp.json()
+            log.debug("[%s] Profile response keys: %s", session.email, list(data.keys()))
+
             details = data.get("memberDetails", data)
             session.member_id = int(details.get("memberId", 0))
             session.member_name = details.get("firstName", "")
+
+            # Build the members list
+            session.members = []
+
+            # Primary member
+            primary = MemberInfo(
+                member_id=session.member_id,
+                first_name=details.get("firstName", ""),
+                last_name=details.get("lastName", ""),
+                name=f"{details.get('firstName', '')} {details.get('lastName', '')}".strip(),
+                relationship="primary",
+            )
+            session.members.append(primary)
+
+            # Check for family / additional members in various response formats
+            family_members = (
+                data.get("familyMembers", [])
+                or data.get("additionalMembers", [])
+                or data.get("members", [])
+                or details.get("familyMembers", [])
+                or details.get("additionalMembers", [])
+            )
+            for fm in family_members:
+                mid = int(fm.get("memberId", fm.get("id", 0)))
+                if mid and mid != session.member_id:
+                    member = MemberInfo(
+                        member_id=mid,
+                        first_name=fm.get("firstName", ""),
+                        last_name=fm.get("lastName", ""),
+                        name=f"{fm.get('firstName', '')} {fm.get('lastName', '')}".strip(),
+                        relationship=fm.get("relationship", fm.get("type", "")),
+                    )
+                    session.members.append(member)
+
+            log.info(
+                "[%s] Found %d member(s): %s",
+                session.email, len(session.members),
+                [(m.display_name(), m.member_id) for m in session.members],
+            )
+
         except Exception as exc:
             log.warning("[%s] Failed to fetch profile: %s", session.email, exc)
 
@@ -283,8 +347,15 @@ class LifetimeAPI:
         url = EVENT_REGISTRATION_URL.format(event_id=event_id)
         try:
             resp = requests.get(url, headers=self._headers(session), timeout=15)
+
+            # Handle auth expiry
+            if resp.status_code == 401:
+                log.warning("Auth expired while checking availability for %s", event_id)
+                return None
+
             resp.raise_for_status()
             data = resp.json()
+            log.debug("Registration data for %s: %s", event_id, list(data.keys()))
         except Exception as exc:
             log.error("Failed to get registration info for %s: %s", event_id, exc)
             return None
@@ -305,6 +376,14 @@ class LifetimeAPI:
         too_soon = rules.get("tooSoonRule", {})
         ev.registration_opens_at = too_soon.get("errorMessage", "")
         ev.too_soon_minutes = too_soon.get("minutesFromStart", 0)
+
+        log.debug(
+            "Event %s: spots=%s remaining=%s waitlist=%s registered=%s unregistered=%s cta='%s' disabled=%s",
+            event_id, ev.has_spots, ev.remaining_spots, ev.has_waitlist,
+            [m.get("name") for m in ev.registered_members],
+            [m.get("name") for m in ev.unregistered_members],
+            ev.register_cta_text, ev.register_disabled,
+        )
 
         return ev
 
@@ -356,6 +435,11 @@ class LifetimeAPI:
 
         Returns RegistrationResult.
         """
+        log.info(
+            "[%s] Starting registration for event %s, members %s",
+            session.email, event_id, member_ids,
+        )
+
         for attempt in range(1, MAX_RETRY_ATTEMPTS + 1):
             log.info(
                 "[%s] Registration attempt %d/%d for event %s, members %s",
@@ -366,8 +450,14 @@ class LifetimeAPI:
                 if result.success or result.waitlisted:
                     return result
                 # If it's a non-retryable error, stop
-                if "not eligible" in result.message.lower() or "age" in result.message.lower():
+                msg_lower = result.message.lower()
+                if any(kw in msg_lower for kw in ["not eligible", "age", "already registered"]):
                     return result
+                # Auth expired — try re-login
+                if "auth expired" in msg_lower or "401" in msg_lower:
+                    log.info("[%s] Re-authenticating …", session.email)
+                    self._apim_key = ""  # force key refresh too
+                    continue
             except Exception as exc:
                 log.error("[%s] Attempt %d error: %s", session.email, attempt, exc)
                 if attempt == MAX_RETRY_ATTEMPTS:
@@ -387,8 +477,12 @@ class LifetimeAPI:
         headers = self._headers(session)
 
         # Step 1: Create registration
-        body = {"eventId": event_id, "memberId": member_ids}
+        # The API accepts memberIds as a list
+        body = {"eventId": event_id, "memberIds": member_ids}
+        log.debug("[%s] POST %s body=%s", session.email, REG_CREATE_URL, body)
         resp = requests.post(REG_CREATE_URL, json=body, headers=headers, timeout=15)
+
+        log.debug("[%s] Create response: %d %s", session.email, resp.status_code, resp.text[:500])
 
         if resp.status_code == 401:
             return RegistrationResult(success=False, message="Auth expired — will re-login.")
@@ -399,6 +493,7 @@ class LifetimeAPI:
         validation = data.get("validation", {})
         if validation:
             notification = validation.get("notification", "")
+            log.info("[%s] Validation: %s", session.email, validation)
             if "already registered" in notification.lower():
                 return RegistrationResult(success=True, message="Already registered.")
             if validation.get("isFatal"):
@@ -407,16 +502,30 @@ class LifetimeAPI:
             if "registration will be open" in notification.lower():
                 return RegistrationResult(success=False, message=notification)
 
-        reg_id = data.get("id", "") or data.get("regId", "")
+        # Try multiple response field names for the registration ID
+        reg_id = (
+            data.get("regId", "")
+            or data.get("id", "")
+            or data.get("registrationId", "")
+            or data.get("registration", {}).get("id", "")
+        )
+        if not reg_id:
+            # If data is a list (batch registration), get the first one
+            if isinstance(data, list) and len(data) > 0:
+                reg_id = data[0].get("regId", "") or data[0].get("id", "")
+
         if not reg_id:
             return RegistrationResult(
                 success=False,
-                message=f"No registration ID returned. Response: {resp.text[:300]}",
+                message=f"No registration ID returned. Status: {resp.status_code}. Response: {resp.text[:500]}",
             )
 
         # Step 2: Complete registration
         complete_url = REG_COMPLETE_URL.format(reg_id=reg_id)
+        log.debug("[%s] PUT %s", session.email, complete_url)
         resp2 = requests.put(complete_url, json={}, headers=headers, timeout=15)
+
+        log.debug("[%s] Complete response: %d %s", session.email, resp2.status_code, resp2.text[:500])
 
         if resp2.ok:
             log.info("[%s] Registration completed! reg_id=%s", session.email, reg_id)
@@ -424,8 +533,8 @@ class LifetimeAPI:
 
         # Check if we're waitlisted
         data2 = resp2.json() if resp2.text else {}
-        msg = data2.get("message", resp2.text[:200])
+        msg = data2.get("message", "") or data2.get("error", "") or resp2.text[:200]
         if "waitlist" in msg.lower():
             return RegistrationResult(success=False, waitlisted=True, reg_id=reg_id, message=msg)
 
-        return RegistrationResult(success=False, reg_id=reg_id, message=f"Complete failed: {msg}")
+        return RegistrationResult(success=False, reg_id=reg_id, message=f"Complete failed ({resp2.status_code}): {msg}")

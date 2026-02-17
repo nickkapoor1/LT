@@ -19,9 +19,10 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from app.backend.api_client import LifetimeAPI, Event
+from app.backend.api_client import LifetimeAPI, Event, MemberInfo
 from app.backend.crypto import add_account, load_accounts, remove_account, save_accounts
 from app.backend.monitor import Monitor
+from app.backend.notifier import load_notify_settings, save_notify_settings
 from app.backend.scheduler import Scheduler
 from app.config.settings import CLUBS, DEFAULT_POLL_INTERVAL_SEC, MIN_POLL_INTERVAL_SEC, MAX_POLL_INTERVAL_SEC
 
@@ -161,9 +162,15 @@ def page_accounts():
                 # Test login
                 if st.button("Test Login", key=f"test_{i}"):
                     with st.spinner("Logging in …"):
-                        session = api.login(acct["email"], acct["password"])
-                        if session.authenticated:
-                            st.success(f"Login OK! Member: {session.member_name} (ID {session.member_id})")
+                        test_session = api.login(acct["email"], acct["password"])
+                        if test_session.authenticated:
+                            st.success(f"Login OK! Primary: {test_session.member_name} (ID {test_session.member_id})")
+                            if test_session.members and len(test_session.members) > 1:
+                                st.info(f"**{len(test_session.members)} member(s) on account:**")
+                                for m in test_session.members:
+                                    st.write(f"  - {m.display_name()} (ID {m.member_id}, {m.relationship or 'member'})")
+                            elif test_session.members:
+                                st.write(f"  - {test_session.members[0].display_name()} (single member)")
                         else:
                             st.error("Login failed — check credentials.")
 
@@ -228,6 +235,9 @@ def page_schedule():
     with col4:
         fetch = st.button("Load Schedule", use_container_width=True)
 
+    # Ensure we have a session for this account
+    session = api.get_session(selected_email)
+
     if fetch:
         with st.spinner("Fetching schedule from Lifetime API …"):
             session = api.ensure_authenticated(acct["email"], acct["password"])
@@ -249,13 +259,43 @@ def page_schedule():
         st.caption("Click **Load Schedule** to fetch events.")
         return
 
+    # -- Account Members Section --
+    if session and session.members:
+        st.subheader("Account Members")
+        member_cols = st.columns(len(session.members))
+        for idx, m in enumerate(session.members):
+            with member_cols[idx]:
+                st.markdown(f"**{m.display_name()}**")
+                st.caption(f"ID: {m.member_id} | {m.relationship or 'member'}")
+    elif session and session.member_id:
+        st.subheader("Account Members")
+        st.write(f"**{session.member_name}** (ID {session.member_id})")
+
+    # -- Member Selection --
     st.subheader(f"Events ({len(events)})")
 
-    # Get member IDs for registration selection
-    session = api.get_session(selected_email)
-    all_member_ids: list[int] = []
-    if session and session.member_id:
-        all_member_ids = [session.member_id]
+    # Build member options for selection
+    member_options = {}
+    if session:
+        if session.members:
+            for m in session.members:
+                member_options[f"{m.display_name()} (ID {m.member_id})"] = m.member_id
+        elif session.member_id:
+            member_options[f"{session.member_name} (ID {session.member_id})"] = session.member_id
+
+    if member_options:
+        selected_member_labels = st.multiselect(
+            "Register these members",
+            options=list(member_options.keys()),
+            default=list(member_options.keys()),
+            help="Choose which member(s) to register. Select one or both.",
+        )
+        selected_member_ids = [member_options[label] for label in selected_member_labels]
+    else:
+        selected_member_ids = []
+        st.info("Log in to see available members.")
+
+    st.divider()
 
     for i, ev in enumerate(events):
         col1, col2 = st.columns([5, 3])
@@ -266,53 +306,48 @@ def page_schedule():
         with col2:
             # Check registration status
             if st.button("Check Availability", key=f"check_{i}"):
-                reg = api.get_event_registration(session, ev.event_id)
-                if reg:
-                    if reg.has_spots:
-                        st.success(f"{reg.remaining_spots} spot(s) available!")
-                    elif reg.has_waitlist:
-                        st.warning(f"Full — waitlist ({reg.total_waitlisted} waiting)")
+                if not session:
+                    st.error("Not logged in — load schedule first.")
+                else:
+                    reg = api.get_event_registration(session, ev.event_id)
+                    if reg:
+                        if reg.has_spots:
+                            st.success(f"{reg.remaining_spots} spot(s) available!")
+                        elif reg.has_waitlist:
+                            st.warning(f"Full — waitlist ({reg.total_waitlisted} waiting)")
+                        else:
+                            st.error("Closed")
+
+                        if reg.registration_opens_at:
+                            st.info(reg.registration_opens_at)
+
+                        # Show member eligibility
+                        for m in reg.unregistered_members:
+                            st.caption(f"Eligible: {m.get('name')} (ID {m.get('id')})")
+                        for m in reg.registered_members:
+                            st.caption(f"Already registered: {m.get('name')}")
                     else:
-                        st.error("Closed")
-
-                    if reg.registration_opens_at:
-                        st.info(reg.registration_opens_at)
-
-                    # Show member eligibility
-                    for m in reg.unregistered_members:
-                        st.caption(f"Eligible: {m.get('name')} (ID {m.get('id')})")
-                    for m in reg.registered_members:
-                        st.caption(f"Already registered: {m.get('name')}")
+                        st.error("Could not fetch availability. Try reloading the schedule.")
 
             if st.button("Add to Watchlist", key=f"watch_{i}"):
-                # Determine members to register
-                if session:
-                    reg = api.get_event_registration(session, ev.event_id)
-                    if reg and reg.unregistered_members:
-                        member_ids = [m["id"] for m in reg.unregistered_members]
-                    else:
-                        member_ids = [session.member_id] if session.member_id else []
+                if not selected_member_ids:
+                    st.error("Select at least one member above.")
+                elif not session:
+                    st.error("Not logged in — load schedule first.")
                 else:
-                    member_ids = []
-
-                if member_ids:
-                    monitor.watch(ev, selected_email, member_ids)
-                    st.success(f"Watching **{ev.title}** for member(s) {member_ids}")
-                else:
-                    st.error("No eligible members found.")
+                    # Use the user-selected member IDs
+                    monitor.watch(ev, selected_email, selected_member_ids)
+                    names = [label for label in selected_member_labels] if selected_member_labels else selected_member_ids
+                    st.success(f"Watching **{ev.title}** for {names}")
 
             if st.button("Register NOW", key=f"reg_{i}"):
                 if not session:
-                    st.error("Not logged in.")
+                    st.error("Not logged in — load schedule first.")
+                elif not selected_member_ids:
+                    st.error("Select at least one member above.")
                 else:
-                    reg = api.get_event_registration(session, ev.event_id)
-                    if reg and reg.unregistered_members:
-                        member_ids = [m["id"] for m in reg.unregistered_members]
-                    else:
-                        member_ids = [session.member_id]
-
                     with st.spinner("Registering …"):
-                        result = api.register(session, ev.event_id, member_ids)
+                        result = api.register(session, ev.event_id, [int(mid) for mid in selected_member_ids])
                         if result.success:
                             st.success(f"Registered! {result.message}")
                         elif result.waitlisted:
@@ -329,6 +364,7 @@ def page_schedule():
 def page_settings():
     st.header("Settings")
 
+    # -- Polling --
     st.subheader("Polling Interval")
     new_interval = st.slider(
         "Seconds between checks",
@@ -346,6 +382,58 @@ def page_settings():
         "For passive monitoring, use 30-60 seconds."
     )
 
+    # -- Adaptive Polling --
+    st.subheader("Adaptive Polling")
+    adaptive = st.checkbox(
+        "Auto-speed-up near registration open time",
+        value=scheduler.adaptive_polling,
+    )
+    if adaptive != scheduler.adaptive_polling:
+        scheduler.adaptive_polling = adaptive
+        st.success(f"Adaptive polling: **{'ON' if adaptive else 'OFF'}**")
+
+    st.caption(
+        "When enabled, the engine automatically polls faster as registration "
+        "windows approach — 1s when <1 min away, 2s when <5 min away."
+    )
+
+    # -- Notifications --
+    st.subheader("Notifications")
+    ns = load_notify_settings()
+
+    col1, col2 = st.columns(2)
+    with col1:
+        ns.desktop_enabled = st.checkbox("Desktop notifications", value=ns.desktop_enabled)
+    with col2:
+        ns.email_enabled = st.checkbox("Email notifications", value=ns.email_enabled)
+
+    if ns.email_enabled:
+        st.markdown("**Email (SMTP) Settings**")
+        ec1, ec2 = st.columns(2)
+        with ec1:
+            ns.smtp_server = st.text_input("SMTP server", value=ns.smtp_server)
+            ns.smtp_port = st.number_input("SMTP port", value=ns.smtp_port, min_value=1, max_value=65535)
+            ns.smtp_user = st.text_input("SMTP username / email", value=ns.smtp_user)
+        with ec2:
+            ns.smtp_password = st.text_input("SMTP password (app password)", value=ns.smtp_password, type="password")
+            ns.notify_to_email = st.text_input("Send alerts to", value=ns.notify_to_email)
+
+    st.markdown("**Notify me when:**")
+    nc1, nc2, nc3, nc4 = st.columns(4)
+    with nc1:
+        ns.on_registration = st.checkbox("Registration succeeds", value=ns.on_registration)
+    with nc2:
+        ns.on_waitlist = st.checkbox("Added to waitlist", value=ns.on_waitlist)
+    with nc3:
+        ns.on_failure = st.checkbox("Registration fails", value=ns.on_failure)
+    with nc4:
+        ns.on_spots_open = st.checkbox("Spots open up", value=ns.on_spots_open)
+
+    if st.button("Save Notification Settings"):
+        save_notify_settings(ns)
+        st.success("Notification settings saved!")
+
+    # -- Watchlist --
     st.subheader("Watchlist")
     watched = monitor.all_watched()
     if watched:
@@ -357,6 +445,7 @@ def page_settings():
     else:
         st.caption("No events being watched.")
 
+    # -- How it works --
     st.subheader("How It Works")
     st.markdown(
         """
@@ -365,6 +454,10 @@ def page_settings():
         3. **Add events to your watchlist** — pick the ones you want.
         4. **Start the engine** — it polls the API every few seconds.
         5. The moment registration opens, it fires the register call instantly.
+        6. You'll get a **notification** (desktop/email) when it succeeds!
+
+        **Adaptive polling** automatically speeds up as registration windows
+        approach — no need to manually adjust the interval.
 
         This uses Lifetime's internal API directly — no browser automation.
         Registration calls complete in milliseconds, not seconds.

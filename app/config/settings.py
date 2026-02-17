@@ -85,6 +85,7 @@ def fetch_api_keys(force: bool = False) -> tuple[str, str]:
 # ---------------------------------------------------------------------------
 CLUBS: dict[str, int] = {
     # Format: "Display Name": clubId
+    # -- New York --
     "PENN 1": 351,
     "Sky (Manhattan)": 250,
     "23rd Street": 364,
@@ -97,20 +98,80 @@ CLUBS: dict[str, int] = {
     "Midtown": 320,
     "NoHo": 345,
     "One Wall Street": 362,
+    "Westchester": 241,
+    # -- New Jersey --
+    "Bergen County": 350,
+    "Montvale": 373,
+    "Berkeley Heights": 316,
+    "Bridgewater": 329,
+    "Florham Park": 310,
+    "Garwood": 317,
+    "Princeton": 352,
+    # -- Atlanta --
     "Alpharetta": 114,
     "Buckhead": 119,
     "Johns Creek": 184,
     "Peachtree Corners": 120,
     "Sugarloaf": 156,
     "Woodstock": 137,
+    # -- Texas (Dallas/Ft Worth) --
     "Flower Mound": 141,
     "Frisco": 158,
     "Plano": 104,
+    "Allen": 191,
+    "Las Colinas": 103,
+    "North Dallas": 185,
+    "Southlake": 189,
+    # -- Texas (Houston) --
+    "Houston Galleria": 163,
+    "Houston Memorial": 197,
+    "Cinco Ranch": 171,
+    "Sugar Land": 172,
+    "The Woodlands": 170,
+    # -- Arizona --
     "Scottsdale": 143,
     "Gilbert": 147,
+    "Paradise Valley": 165,
+    "Tempe": 176,
+    "North Scottsdale": 203,
+    # -- Minnesota --
     "Edina": 8,
     "Plymouth": 7,
     "St. Louis Park": 3,
+    "Bloomington South": 4,
+    "Eagan": 5,
+    "Lakeville": 10,
+    "Maple Grove": 14,
+    "Woodbury": 11,
+    "Eden Prairie": 6,
+    "Chanhassen": 9,
+    "Fridley": 13,
+    "Rochester": 18,
+    "Target Center": 371,
+    # -- Colorado --
+    "Centennial": 136,
+    "Flatirons (Broomfield)": 166,
+    "Highlands Ranch": 134,
+    "Lone Tree": 135,
+    "Parker": 177,
+    # -- Chicago --
+    "Lincoln Park": 298,
+    "Schaumburg": 159,
+    "Warrenville": 160,
+    "Algonquin": 186,
+    # -- Michigan --
+    "Troy": 199,
+    "Rochester Hills": 200,
+    "Novi": 202,
+    "Shelby Township": 198,
+    # -- Virginia --
+    "Centreville": 221,
+    "Gainesville": 266,
+    "Reston": 374,
+    # -- Utah --
+    "Cottonwood Heights": 153,
+    "Draper": 152,
+    "Jordan Landing": 154,
 }
 
 # ---------------------------------------------------------------------------
