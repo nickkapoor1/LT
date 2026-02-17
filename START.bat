@@ -25,6 +25,11 @@ echo Python found!
 python --version
 echo.
 
+:: Pull latest code from GitHub
+echo Pulling latest updates from GitHub...
+git pull
+echo.
+
 :: Install dependencies
 echo Installing dependencies...
 pip install streamlit requests cryptography
