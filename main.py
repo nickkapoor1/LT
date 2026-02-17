@@ -24,7 +24,7 @@ from app.backend.crypto import add_account, load_accounts, remove_account, save_
 from app.backend.monitor import Monitor
 from app.backend.notifier import load_notify_settings, save_notify_settings
 from app.backend.scheduler import Scheduler
-from app.config.settings import CLUBS, DEFAULT_POLL_INTERVAL_SEC, MIN_POLL_INTERVAL_SEC, MAX_POLL_INTERVAL_SEC
+from app.config.settings import CLUBS, CLUB_REGIONS, DEFAULT_POLL_INTERVAL_SEC, MIN_POLL_INTERVAL_SEC, MAX_POLL_INTERVAL_SEC
 
 logging.basicConfig(
     level=logging.INFO,
@@ -223,36 +223,77 @@ def page_schedule():
         st.warning("No enabled accounts.")
         return
 
-    col1, col2, col3, col4 = st.columns([2, 2, 2, 1])
-    with col1:
-        selected_email = st.selectbox("Account", [a["email"] for a in enabled])
+    # -- Account selection --
+    selected_email = st.selectbox("Account", [a["email"] for a in enabled])
     acct = next(a for a in enabled if a["email"] == selected_email)
 
-    with col2:
+    # -- Multi-club selection with region presets --
+    st.subheader("Clubs")
+
+    # Region quick-select buttons
+    region_cols = st.columns(len(CLUB_REGIONS))
+    preset_clubs: list[str] = []
+    for idx, (region, clubs_in_region) in enumerate(CLUB_REGIONS.items()):
+        with region_cols[idx]:
+            if st.button(region, key=f"region_{region}", use_container_width=True):
+                st.session_state["selected_clubs"] = clubs_in_region
+
+    # Initialize selected clubs from session state or account default
+    default_clubs = st.session_state.get("selected_clubs", [acct.get("club_name", "PENN 1")])
+
+    selected_clubs = st.multiselect(
+        "Select clubs to search",
+        options=list(CLUBS.keys()),
+        default=[c for c in default_clubs if c in CLUBS],
+        help="Pick one or more clubs. Use the region buttons above for quick presets.",
+    )
+    st.session_state["selected_clubs"] = selected_clubs
+
+    # -- Date range --
+    dc1, dc2, dc3 = st.columns([2, 2, 1])
+    with dc1:
         start = st.date_input("From", value=datetime.now().date())
-    with col3:
+    with dc2:
         end = st.date_input("To", value=datetime.now().date() + timedelta(days=7))
-    with col4:
+    with dc3:
         fetch = st.button("Load Schedule", use_container_width=True)
 
     # Ensure we have a session for this account
     session = api.get_session(selected_email)
 
     if fetch:
-        with st.spinner("Fetching schedule from Lifetime API …"):
+        if not selected_clubs:
+            st.error("Select at least one club.")
+            return
+
+        with st.spinner(f"Fetching schedule from {len(selected_clubs)} club(s) …"):
             session = api.ensure_authenticated(acct["email"], acct["password"])
             if not session.authenticated:
                 st.error("Login failed.")
                 return
-            events = api.get_events(
-                session,
-                acct["club_name"],
-                start.strftime("%m/%d/%Y"),
-                end.strftime("%m/%d/%Y"),
-            )
-            st.session_state.events = events
+
+            all_events: list[Event] = []
+            start_str = start.strftime("%m/%d/%Y")
+            end_str = end.strftime("%m/%d/%Y")
+
+            # Fetch from each selected club
+            progress = st.progress(0, text="Loading …")
+            for club_idx, club_name in enumerate(selected_clubs):
+                progress.progress(
+                    (club_idx + 1) / len(selected_clubs),
+                    text=f"Fetching {club_name} …",
+                )
+                club_events = api.get_events(session, club_name, start_str, end_str)
+                all_events.extend(club_events)
+            progress.empty()
+
+            # Sort by start time
+            all_events.sort(key=lambda e: e.start)
+
+            st.session_state.events = all_events
             st.session_state.schedule_email = selected_email
-            st.success(f"Found **{len(events)}** pickleball events.")
+            club_summary = ", ".join(selected_clubs) if len(selected_clubs) <= 3 else f"{len(selected_clubs)} clubs"
+            st.success(f"Found **{len(all_events)}** pickleball events across {club_summary}.")
 
     events: list[Event] = st.session_state.get("events", [])
     if not events:
@@ -275,7 +316,7 @@ def page_schedule():
     st.subheader(f"Events ({len(events)})")
 
     # Build member options for selection
-    member_options = {}
+    member_options: dict[str, int] = {}
     if session:
         if session.members:
             for m in session.members:
@@ -283,6 +324,7 @@ def page_schedule():
         elif session.member_id:
             member_options[f"{session.member_name} (ID {session.member_id})"] = session.member_id
 
+    selected_member_labels: list[str] = []
     if member_options:
         selected_member_labels = st.multiselect(
             "Register these members",
@@ -299,9 +341,12 @@ def page_schedule():
 
     for i, ev in enumerate(events):
         col1, col2 = st.columns([5, 3])
-        col1.markdown(f"**{ev.title}**")
+        # Show club name for multi-club searches
+        club_tag = f" — *{ev.club or ev.location}*" if ev.club or ev.location else ""
+        col1.markdown(f"**{ev.title}**{club_tag}")
         col1.caption(f"{ev.display_time()}")
-        col1.caption(f"{ev.location}")
+        if ev.location:
+            col1.caption(f"{ev.location}")
 
         with col2:
             # Check registration status
@@ -337,7 +382,7 @@ def page_schedule():
                 else:
                     # Use the user-selected member IDs
                     monitor.watch(ev, selected_email, selected_member_ids)
-                    names = [label for label in selected_member_labels] if selected_member_labels else selected_member_ids
+                    names = selected_member_labels if selected_member_labels else selected_member_ids
                     st.success(f"Watching **{ev.title}** for {names}")
 
             if st.button("Register NOW", key=f"reg_{i}"):

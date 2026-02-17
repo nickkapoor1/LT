@@ -175,6 +175,49 @@ CLUBS: dict[str, int] = {
 }
 
 # ---------------------------------------------------------------------------
+# Club regions — for quick multi-select in the UI
+# ---------------------------------------------------------------------------
+CLUB_REGIONS: dict[str, list[str]] = {
+    "New York": [
+        "PENN 1", "Sky (Manhattan)", "23rd Street", "Atlantic Avenue",
+        "Battery Park", "Brooklyn Tower", "Bryant Park", "Dumbo",
+        "Fifth Avenue", "Midtown", "NoHo", "One Wall Street", "Westchester",
+    ],
+    "New Jersey": [
+        "Bergen County", "Montvale", "Berkeley Heights", "Bridgewater",
+        "Florham Park", "Garwood", "Princeton",
+    ],
+    "Atlanta": [
+        "Alpharetta", "Buckhead", "Johns Creek", "Peachtree Corners",
+        "Sugarloaf", "Woodstock",
+    ],
+    "Dallas / Ft Worth": [
+        "Flower Mound", "Frisco", "Plano", "Allen", "Las Colinas",
+        "North Dallas", "Southlake",
+    ],
+    "Houston": [
+        "Houston Galleria", "Houston Memorial", "Cinco Ranch",
+        "Sugar Land", "The Woodlands",
+    ],
+    "Arizona": [
+        "Scottsdale", "Gilbert", "Paradise Valley", "Tempe", "North Scottsdale",
+    ],
+    "Minnesota": [
+        "Edina", "Plymouth", "St. Louis Park", "Bloomington South", "Eagan",
+        "Lakeville", "Maple Grove", "Woodbury", "Eden Prairie", "Chanhassen",
+        "Fridley", "Rochester", "Target Center",
+    ],
+    "Colorado": [
+        "Centennial", "Flatirons (Broomfield)", "Highlands Ranch",
+        "Lone Tree", "Parker",
+    ],
+    "Chicago": ["Lincoln Park", "Schaumburg", "Warrenville", "Algonquin"],
+    "Michigan": ["Troy", "Rochester Hills", "Novi", "Shelby Township"],
+    "Virginia": ["Centreville", "Gainesville", "Reston"],
+    "Utah": ["Cottonwood Heights", "Draper", "Jordan Landing"],
+}
+
+# ---------------------------------------------------------------------------
 # Polling / automation defaults
 # ---------------------------------------------------------------------------
 DEFAULT_POLL_INTERVAL_SEC = 5         # seconds between checks during snipe window
