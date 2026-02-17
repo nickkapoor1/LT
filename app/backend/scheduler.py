@@ -317,9 +317,16 @@ class Scheduler:
         result = self._api.register(session, ws.event.event_id, target_ids)
 
         if result.success:
-            self.monitor.mark_registered(ws)
-            self._log(email, f"REGISTERED for {ws.event.title}!", "success")
-            self._notifier.notify_registered(email, ws.event.title, ws.event.display_time())
+            # Verify the outcome — API might say "success" but actually waitlisted
+            verification = self._api.verify_registration(session, ws.event.event_id, target_ids)
+            if verification == "waitlisted":
+                self.monitor.mark_waitlisted(ws)
+                self._log(email, f"API said success but verification shows WAITLISTED for {ws.event.title}.", "warning")
+                self._notifier.notify_waitlisted(email, ws.event.title, ws.event.display_time())
+            else:
+                self.monitor.mark_registered(ws)
+                self._log(email, f"REGISTERED for {ws.event.title}!", "success")
+                self._notifier.notify_registered(email, ws.event.title, ws.event.display_time())
         elif result.waitlisted:
             self.monitor.mark_waitlisted(ws)
             self._log(email, f"Waitlisted for {ws.event.title}.", "warning")
@@ -362,53 +369,75 @@ class Scheduler:
 
     def _snipe_worker(self, ws: WatchedEvent, acct: dict, seconds_until: float) -> None:
         """
-        Worker thread: sleep until open time, then fire registration rapidly.
+        Worker thread: sleep until just BEFORE open time, then fire rapid
+        registration attempts.  We start 1.5 seconds early to account for
+        clock skew between our machine and Lifetime's servers.
         """
         email = ws.account_email
         snipe_key = ws.key
 
+        # How far ahead of the published open time to start firing (seconds)
+        PRE_FIRE_SEC = 1.5
+        MAX_ATTEMPTS = 10
+        ATTEMPT_DELAY = 0.2  # 200ms between rapid attempts
+
         try:
-            # Sleep until 2 seconds before open time (coarse sleep)
-            coarse_wait = max(0, seconds_until - 2)
+            # Re-authenticate early so we have a fresh token ready to go
+            self._log(email, f"Pre-authenticating for snipe on {ws.event.title} …")
+            session = self._api.ensure_authenticated(acct["email"], acct["password"])
+            if not session.authenticated:
+                self._log(email, f"Snipe pre-auth failed for {ws.event.title}", "error")
+                return
+
+            # Sleep until PRE_FIRE_SEC + 3s before open time (coarse sleep)
+            coarse_wait = max(0, seconds_until - PRE_FIRE_SEC - 3)
             if coarse_wait > 0:
-                # Sleep in 1-second ticks so we can stop if engine stops
                 for _ in range(int(coarse_wait)):
                     if self._stop_event.is_set() or ws.registration_status != "pending":
                         return
                     time.sleep(1)
 
-            # Precision wait: busy-wait the final 2 seconds for exact timing
+            # Refresh auth right before we fire (token could be 2+ hours old)
+            session = self._api.ensure_authenticated(acct["email"], acct["password"])
+            if not session.authenticated:
+                self._log(email, f"Snipe auth refresh failed for {ws.event.title}", "error")
+                return
+
+            # Precision wait: busy-wait until PRE_FIRE_SEC before open time
             if ws.registration_opens_at_dt:
-                while datetime.now() < ws.registration_opens_at_dt:
+                fire_at = ws.registration_opens_at_dt - timedelta(seconds=PRE_FIRE_SEC)
+                while datetime.now() < fire_at:
                     if self._stop_event.is_set() or ws.registration_status != "pending":
                         return
                     time.sleep(0.05)  # 50ms precision
 
-            # GO! Fire registration immediately
-            self._log(email, f"SNIPE FIRING for {ws.event.title}!", "info")
+            # GO! Start firing BEFORE the exact open time
+            self._log(email, f"SNIPE FIRING for {ws.event.title}! ({MAX_ATTEMPTS} rapid attempts)", "info")
             self._snipe_fired.add(snipe_key)
 
-            # Re-authenticate for a fresh session
-            session = self._api.ensure_authenticated(acct["email"], acct["password"])
-            if not session.authenticated:
-                self._log(email, f"Snipe auth failed for {ws.event.title}", "error")
-                return
-
-            # Rapid-fire registration attempts (up to 5 tries within a few seconds)
-            for attempt in range(1, 6):
+            for attempt in range(1, MAX_ATTEMPTS + 1):
                 if self._stop_event.is_set() or ws.registration_status != "pending":
                     return
 
                 self._log(
                     email,
-                    f"Snipe attempt {attempt}/5 for {ws.event.title} …",
+                    f"Snipe attempt {attempt}/{MAX_ATTEMPTS} for {ws.event.title} …",
                 )
                 result = self._api.register(session, ws.event.event_id, ws.member_ids)
 
                 if result.success:
-                    self.monitor.mark_registered(ws)
-                    self._log(email, f"SNIPE SUCCESS! Registered for {ws.event.title}!", "success")
-                    self._notifier.notify_registered(email, ws.event.title, ws.event.display_time())
+                    # Verify the outcome to catch silent waitlist placement
+                    verification = self._api.verify_registration(
+                        session, ws.event.event_id, ws.member_ids
+                    )
+                    if verification == "waitlisted":
+                        self.monitor.mark_waitlisted(ws)
+                        self._log(email, f"Snipe: API said success but verification shows WAITLISTED for {ws.event.title}.", "warning")
+                        self._notifier.notify_waitlisted(email, ws.event.title, ws.event.display_time())
+                    else:
+                        self.monitor.mark_registered(ws)
+                        self._log(email, f"SNIPE SUCCESS! Registered for {ws.event.title}!", "success")
+                        self._notifier.notify_registered(email, ws.event.title, ws.event.display_time())
                     return
                 elif result.waitlisted:
                     self.monitor.mark_waitlisted(ws)
@@ -416,15 +445,18 @@ class Scheduler:
                     self._notifier.notify_waitlisted(email, ws.event.title, ws.event.display_time())
                     return
                 else:
-                    self._log(
-                        email,
-                        f"Snipe attempt {attempt} failed: {result.message}",
-                        "warning",
-                    )
-                    # Very short delay between rapid attempts
-                    time.sleep(0.3)
+                    # "registration will be open" means we're still too early — keep trying
+                    if "registration will be open" in result.message.lower() or "too soon" in result.message.lower():
+                        self._log(email, f"Snipe attempt {attempt}: Not open yet, retrying …")
+                    else:
+                        self._log(
+                            email,
+                            f"Snipe attempt {attempt} failed: {result.message}",
+                            "warning",
+                        )
+                    time.sleep(ATTEMPT_DELAY)
 
-            self._log(email, f"Snipe exhausted 5 attempts for {ws.event.title}. Normal polling will continue.", "warning")
+            self._log(email, f"Snipe exhausted {MAX_ATTEMPTS} attempts for {ws.event.title}. Normal polling will continue.", "warning")
 
         except Exception as exc:
             log.error("[%s] Snipe worker error: %s", email, exc)

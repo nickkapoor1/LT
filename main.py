@@ -343,6 +343,10 @@ def page_schedule():
     if not session or not session.authenticated:
         session = api.ensure_authenticated(acct["email"], acct["password"])
 
+    # Auto-discover members if we only have the primary (family members missing)
+    if session and session.authenticated and len(session.members) <= 1 and events:
+        api.discover_members(session, events[0].event_id)
+
     # -- Account Members Section --
     if session and session.members and len(session.members) > 1:
         st.subheader("Account Members")
@@ -354,6 +358,11 @@ def page_schedule():
     elif session and session.member_id:
         st.subheader("Account Members")
         st.write(f"**{session.member_name}** (ID {session.member_id})")
+        if events:
+            st.caption("Only primary member found. Discovering family members …")
+            api.discover_members(session, events[0].event_id)
+            if len(session.members) > 1:
+                st.rerun()
 
     # -- Member Selection --
     st.subheader(f"Events ({len(events)})")
@@ -457,16 +466,56 @@ def page_schedule():
                                 st.error("Login failed — check your credentials in the Accounts tab.")
                             else:
                                 member_ids_int = [int(mid) for mid in selected_member_ids]
-                                st.caption(f"Registering members {member_ids_int} for event {ev.event_id[:20]}…")
+                                member_names = [l.split(" (ID")[0] for l in selected_member_labels] if selected_member_labels else member_ids_int
+                                st.caption(f"Registering {member_names} …")
                                 result = api.register(session, ev.event_id, member_ids_int)
                                 if result.success:
-                                    st.success(f"Registered! {result.message}")
+                                    # Verify: is it actually registered or secretly waitlisted?
+                                    verification = api.verify_registration(session, ev.event_id, member_ids_int)
+                                    if verification == "waitlisted":
+                                        st.warning(f"WAITLISTED — session is full. You're on the waitlist, not confirmed.")
+                                    else:
+                                        st.success(f"CONFIRMED — You are registered! {result.message}")
                                 elif result.waitlisted:
-                                    st.warning(f"Waitlisted: {result.message}")
+                                    st.warning(f"WAITLISTED — session is full. {result.message}")
                                 else:
                                     st.error(f"Failed: {result.message}")
                         except Exception as exc:
                             st.error(f"Registration error: {exc}")
+
+            # Auto-Register (Snipe) — adds to watchlist with snipe scheduling
+            if st.button("Auto-Register (Snipe)", key=f"snipe_{i}"):
+                if not selected_member_ids:
+                    st.error("Select at least one member above.")
+                else:
+                    member_ids_int = [int(mid) for mid in selected_member_ids]
+                    ws = monitor.watch(ev, selected_email, member_ids_int)
+
+                    # Pre-check: get registration timing info
+                    reg = api.get_event_registration(session, ev.event_id)
+                    if reg and reg.too_soon_minutes and ev.start:
+                        try:
+                            from datetime import datetime as _dt
+                            event_start = _dt.fromisoformat(ev.start)
+                            opens_at = event_start - timedelta(minutes=reg.too_soon_minutes)
+                            ws.registration_opens_at_dt = opens_at
+                            ws.registration_opens_at_display = opens_at.strftime("%a %b %d, %I:%M %p")
+                            now = _dt.now()
+                            delta = (opens_at - now).total_seconds()
+                            if delta > 0:
+                                countdown = scheduler._format_countdown(delta)
+                                st.success(
+                                    f"SNIPE QUEUED — Will auto-register at **{ws.registration_opens_at_display}** "
+                                    f"(in {countdown}). Start the engine to activate."
+                                )
+                            else:
+                                st.success("Added to auto-register queue. Start the engine — registration is already open!")
+                        except Exception:
+                            st.success("Added to auto-register queue. Start the engine to activate.")
+                    elif reg and not reg.register_disabled:
+                        st.success("Added to auto-register queue. Registration is OPEN — start the engine to register immediately!")
+                    else:
+                        st.success("Added to auto-register queue. Start the engine to activate.")
 
         st.divider()
 

@@ -135,6 +135,8 @@ class LifetimeAPI:
     def __init__(self) -> None:
         self._sessions: dict[str, AuthSession] = {}  # email → AuthSession
         self._apim_key: str = ""
+        # Persistent member cache — survives session re-authentication
+        self._member_cache: dict[str, list[MemberInfo]] = {}  # email → members
 
     def _ensure_keys(self) -> str:
         """Fetch and cache the APIM subscription key."""
@@ -263,13 +265,26 @@ class LifetimeAPI:
                     session.members.append(member)
 
             log.info(
-                "[%s] Found %d member(s): %s",
+                "[%s] Found %d member(s) from profile: %s",
                 session.email, len(session.members),
                 [(m.display_name(), m.member_id) for m in session.members],
             )
 
+            # If profile only returned the primary member, restore cached family members
+            cached = self._member_cache.get(session.email)
+            if cached and len(cached) > len(session.members):
+                log.info(
+                    "[%s] Restoring %d cached member(s) (profile only returned %d)",
+                    session.email, len(cached), len(session.members),
+                )
+                session.members = cached
+
         except Exception as exc:
             log.warning("[%s] Failed to fetch profile: %s", session.email, exc)
+            # Still try to restore cached members
+            cached = self._member_cache.get(session.email)
+            if cached:
+                session.members = cached
 
     # ------------------------------------------------------------------
     # Schedule browsing
@@ -425,6 +440,8 @@ class LifetimeAPI:
 
         if discovered:
             session.members = discovered
+            # Persist to cache so members survive re-authentication
+            self._member_cache[session.email] = discovered
             log.info(
                 "[%s] Discovered %d member(s) from event registration: %s",
                 session.email, len(discovered),
@@ -432,6 +449,43 @@ class LifetimeAPI:
             )
 
         return session.members
+
+    def verify_registration(
+        self,
+        session: AuthSession,
+        event_id: str,
+        member_ids: list[int],
+    ) -> str:
+        """
+        After a registration attempt, verify the actual outcome by checking
+        the event registration endpoint.
+
+        Returns: "registered", "waitlisted", or "unknown"
+        """
+        try:
+            reg = self.get_event_registration(session, event_id)
+            if not reg:
+                return "unknown"
+
+            registered_ids = {int(m.get("id", 0)) for m in reg.registered_members}
+            all_registered = all(mid in registered_ids for mid in member_ids)
+
+            if all_registered:
+                return "registered"
+
+            # Check CTA text for waitlist indicators
+            cta_lower = reg.register_cta_text.lower()
+            if any(kw in cta_lower for kw in ["waitlist", "wait list", "leave wait"]):
+                return "waitlisted"
+
+            # If no spots and member isn't in registered list, likely waitlisted
+            if not reg.has_spots and not all_registered:
+                return "waitlisted"
+
+            return "unknown"
+        except Exception as exc:
+            log.debug("Verification check failed: %s", exc)
+            return "unknown"
 
     def get_my_reservations(
         self,
@@ -573,14 +627,36 @@ class LifetimeAPI:
 
         log.debug("[%s] Complete response: %d %s", session.email, resp2.status_code, resp2.text[:500])
 
+        # Parse the completion response regardless of status code
+        data2 = {}
+        try:
+            data2 = resp2.json() if resp2.text else {}
+        except Exception:
+            pass
+        msg2 = data2.get("message", "") or data2.get("error", "") or ""
+        full_resp_text = resp2.text[:500] if resp2.text else ""
+
+        # Check for waitlist indicators anywhere in the response
+        waitlist_keywords = ["waitlist", "wait list", "waiting list", "added to wait", "join wait"]
+        is_waitlisted = any(kw in full_resp_text.lower() for kw in waitlist_keywords)
+
+        # Also check step 1 (create) response for waitlist clues
+        step1_text = str(data).lower()
+        if any(kw in step1_text for kw in waitlist_keywords):
+            is_waitlisted = True
+
         if resp2.ok:
+            if is_waitlisted:
+                log.info("[%s] Registration completed but WAITLISTED. reg_id=%s", session.email, reg_id)
+                return RegistrationResult(
+                    success=False, waitlisted=True, reg_id=reg_id,
+                    message=msg2 or "Added to waitlist (session was full).",
+                )
             log.info("[%s] Registration completed! reg_id=%s", session.email, reg_id)
             return RegistrationResult(success=True, reg_id=reg_id, message="Registered successfully!")
 
-        # Check if we're waitlisted
-        data2 = resp2.json() if resp2.text else {}
-        msg = data2.get("message", "") or data2.get("error", "") or resp2.text[:200]
-        if "waitlist" in msg.lower():
-            return RegistrationResult(success=False, waitlisted=True, reg_id=reg_id, message=msg)
+        # Non-OK response
+        if is_waitlisted:
+            return RegistrationResult(success=False, waitlisted=True, reg_id=reg_id, message=msg2 or full_resp_text[:200])
 
-        return RegistrationResult(success=False, reg_id=reg_id, message=f"Complete failed ({resp2.status_code}): {msg}")
+        return RegistrationResult(success=False, reg_id=reg_id, message=f"Complete failed ({resp2.status_code}): {msg2 or full_resp_text[:200]}")
