@@ -181,19 +181,24 @@ def page_dashboard():
             if not all_reservations:
                 st.info("No upcoming registrations found in the next 14 days.")
             else:
-                # Sort by start time
-                all_reservations.sort(key=lambda x: x[1].get("start", ""))
+                # Sort by start time (handle nested event structure)
+                def _sort_start(item):
+                    r = item[1]
+                    return r.get("start") or r.get("event", {}).get("start", "") or r.get("startDate", "") or ""
+                all_reservations.sort(key=_sort_start)
                 st.caption(f"**{len(all_reservations)}** upcoming registration(s)")
 
                 for acct, res in all_reservations:
-                    r_title = res.get("title", "Unknown Event")
-                    r_start = res.get("start", "")
-                    r_end = res.get("end", "")
-                    r_location = res.get("location", "") or res.get("club", "")
-                    r_event_id = res.get("eventId", "") or res.get("id", "")
-                    r_reg_id = res.get("regId", "") or res.get("registrationId", "")
-                    r_status = res.get("status", "")
-                    r_members = res.get("attendees", []) or res.get("members", [])
+                    # The API may nest event details under an "event" sub-object
+                    ev = res.get("event", {}) if isinstance(res.get("event"), dict) else {}
+                    r_title = res.get("title") or ev.get("title") or res.get("eventName") or ev.get("name") or "Unknown Event"
+                    r_start = res.get("start") or ev.get("start") or res.get("startDate") or ""
+                    r_end = res.get("end") or ev.get("end") or res.get("endDate") or ""
+                    r_location = res.get("location") or res.get("club") or ev.get("location") or ev.get("club") or ""
+                    r_event_id = res.get("eventId") or ev.get("id") or res.get("id") or ""
+                    r_reg_id = res.get("regId") or res.get("registrationId") or res.get("reservationId") or ""
+                    r_status = res.get("status") or res.get("registrationStatus") or ""
+                    r_members = res.get("attendees") or res.get("members") or res.get("registrants") or ev.get("attendees") or []
 
                     # Format time
                     try:

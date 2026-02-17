@@ -523,10 +523,40 @@ class LifetimeAPI:
                 headers=self._headers(session),
                 timeout=20,
             )
+            log.debug(
+                "[%s] Reservations response: status=%d len=%d",
+                session.email, resp.status_code, len(resp.text),
+            )
             resp.raise_for_status()
-            return resp.json().get("results", [])
+            data = resp.json()
+
+            # The API may return results under different keys depending on version
+            results: list[dict] = []
+            if isinstance(data, list):
+                results = data
+            elif isinstance(data, dict):
+                results = (
+                    data.get("results")
+                    or data.get("reservations")
+                    or data.get("items")
+                    or data.get("data")
+                    or []
+                )
+
+            if not results and isinstance(data, dict):
+                log.warning(
+                    "[%s] Reservations response had 0 results. Top-level keys: %s  (snippet: %s)",
+                    session.email, list(data.keys()), str(data)[:500],
+                )
+            else:
+                log.debug(
+                    "[%s] Found %d reservation(s). First item keys: %s",
+                    session.email, len(results),
+                    list(results[0].keys()) if results else "N/A",
+                )
+            return results
         except Exception as exc:
-            log.error("Failed to fetch reservations: %s", exc)
+            log.error("[%s] Failed to fetch reservations: %s", session.email, exc)
             return []
 
     # ------------------------------------------------------------------
