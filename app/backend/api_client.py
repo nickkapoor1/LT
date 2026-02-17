@@ -387,6 +387,52 @@ class LifetimeAPI:
 
         return ev
 
+    def discover_members(self, session: AuthSession, event_id: str) -> list[MemberInfo]:
+        """
+        Discover all members on the account by checking an event's registration.
+
+        The event registration endpoint returns registeredMembers and
+        unregisteredMembers — this is the only reliable way to see ALL
+        members (primary + family) on the account.
+        """
+        reg = self.get_event_registration(session, event_id)
+        if not reg:
+            return session.members  # fall back to what we have
+
+        all_api_members: list[dict] = []
+        all_api_members.extend(reg.registered_members or [])
+        all_api_members.extend(reg.unregistered_members or [])
+
+        if not all_api_members:
+            return session.members
+
+        # Build MemberInfo list from the API response
+        discovered: list[MemberInfo] = []
+        seen_ids: set[int] = set()
+        for m in all_api_members:
+            mid = int(m.get("id", 0))
+            if not mid or mid in seen_ids:
+                continue
+            seen_ids.add(mid)
+            name = m.get("name", "")
+            discovered.append(MemberInfo(
+                member_id=mid,
+                name=name,
+                first_name=name.split()[0] if name else "",
+                last_name=" ".join(name.split()[1:]) if name and len(name.split()) > 1 else "",
+                relationship="primary" if mid == session.member_id else "family",
+            ))
+
+        if discovered:
+            session.members = discovered
+            log.info(
+                "[%s] Discovered %d member(s) from event registration: %s",
+                session.email, len(discovered),
+                [(m.display_name(), m.member_id) for m in discovered],
+            )
+
+        return session.members
+
     def get_my_reservations(
         self,
         session: AuthSession,
@@ -477,8 +523,8 @@ class LifetimeAPI:
         headers = self._headers(session)
 
         # Step 1: Create registration
-        # The API accepts memberIds as a list
-        body = {"eventId": event_id, "memberIds": member_ids}
+        # The API expects "memberId" (singular) with a list of member IDs
+        body = {"eventId": event_id, "memberId": member_ids}
         log.debug("[%s] POST %s body=%s", session.email, REG_CREATE_URL, body)
         resp = requests.post(REG_CREATE_URL, json=body, headers=headers, timeout=15)
 

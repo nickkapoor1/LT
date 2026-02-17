@@ -161,16 +161,23 @@ def page_accounts():
 
                 # Test login
                 if st.button("Test Login", key=f"test_{i}"):
-                    with st.spinner("Logging in …"):
+                    with st.spinner("Logging in and discovering members …"):
                         test_session = api.login(acct["email"], acct["password"])
                         if test_session.authenticated:
                             st.success(f"Login OK! Primary: {test_session.member_name} (ID {test_session.member_id})")
-                            if test_session.members and len(test_session.members) > 1:
+
+                            # Discover all members via an event check
+                            club = acct.get("club_name", "PENN 1")
+                            today = datetime.now().strftime("%m/%d/%Y")
+                            week = (datetime.now() + timedelta(days=7)).strftime("%m/%d/%Y")
+                            test_events = api.get_events(test_session, club, today, week)
+                            if test_events:
+                                api.discover_members(test_session, test_events[0].event_id)
+
+                            if test_session.members:
                                 st.info(f"**{len(test_session.members)} member(s) on account:**")
                                 for m in test_session.members:
-                                    st.write(f"  - {m.display_name()} (ID {m.member_id}, {m.relationship or 'member'})")
-                            elif test_session.members:
-                                st.write(f"  - {test_session.members[0].display_name()} (single member)")
+                                    st.write(f"  - {m.display_name()} (ID {m.member_id})")
                         else:
                             st.error("Login failed — check credentials.")
 
@@ -290,18 +297,29 @@ def page_schedule():
             # Sort by start time
             all_events.sort(key=lambda e: e.start)
 
+            # Discover all members on the account using the first event
+            if all_events:
+                api.discover_members(session, all_events[0].event_id)
+
             st.session_state.events = all_events
             st.session_state.schedule_email = selected_email
             club_summary = ", ".join(selected_clubs) if len(selected_clubs) <= 3 else f"{len(selected_clubs)} clubs"
             st.success(f"Found **{len(all_events)}** pickleball events across {club_summary}.")
+            if session.members:
+                names = [f"{m.display_name()} (ID {m.member_id})" for m in session.members]
+                st.info(f"Members on account: {', '.join(names)}")
 
     events: list[Event] = st.session_state.get("events", [])
     if not events:
         st.caption("Click **Load Schedule** to fetch events.")
         return
 
+    # Re-authenticate if session was lost (Streamlit rerun)
+    if not session or not session.authenticated:
+        session = api.ensure_authenticated(acct["email"], acct["password"])
+
     # -- Account Members Section --
-    if session and session.members:
+    if session and session.members and len(session.members) > 1:
         st.subheader("Account Members")
         member_cols = st.columns(len(session.members))
         for idx, m in enumerate(session.members):
@@ -315,14 +333,13 @@ def page_schedule():
     # -- Member Selection --
     st.subheader(f"Events ({len(events)})")
 
-    # Build member options for selection
+    # Build member options from session.members (populated by discover_members)
     member_options: dict[str, int] = {}
-    if session:
-        if session.members:
-            for m in session.members:
-                member_options[f"{m.display_name()} (ID {m.member_id})"] = m.member_id
-        elif session.member_id:
-            member_options[f"{session.member_name} (ID {session.member_id})"] = session.member_id
+    if session and session.members:
+        for m in session.members:
+            member_options[f"{m.display_name()} (ID {m.member_id})"] = m.member_id
+    elif session and session.member_id:
+        member_options[f"{session.member_name} (ID {session.member_id})"] = session.member_id
 
     selected_member_labels: list[str] = []
     if member_options:
@@ -335,7 +352,7 @@ def page_schedule():
         selected_member_ids = [member_options[label] for label in selected_member_labels]
     else:
         selected_member_ids = []
-        st.info("Log in to see available members.")
+        st.info("Log in to see available members. Click **Load Schedule** first.")
 
     st.divider()
 
@@ -351,44 +368,43 @@ def page_schedule():
         with col2:
             # Check registration status
             if st.button("Check Availability", key=f"check_{i}"):
-                if not session:
-                    st.error("Not logged in — load schedule first.")
-                else:
-                    reg = api.get_event_registration(session, ev.event_id)
-                    if reg:
-                        if reg.has_spots:
-                            st.success(f"{reg.remaining_spots} spot(s) available!")
-                        elif reg.has_waitlist:
-                            st.warning(f"Full — waitlist ({reg.total_waitlisted} waiting)")
-                        else:
-                            st.error("Closed")
-
-                        if reg.registration_opens_at:
-                            st.info(reg.registration_opens_at)
-
-                        # Show member eligibility
-                        for m in reg.unregistered_members:
-                            st.caption(f"Eligible: {m.get('name')} (ID {m.get('id')})")
-                        for m in reg.registered_members:
-                            st.caption(f"Already registered: {m.get('name')}")
+                reg = api.get_event_registration(session, ev.event_id)
+                if reg:
+                    if reg.has_spots:
+                        st.success(f"{reg.remaining_spots} spot(s) available!")
+                    elif reg.has_waitlist:
+                        st.warning(f"Full — waitlist ({reg.total_waitlisted} waiting)")
                     else:
-                        st.error("Could not fetch availability. Try reloading the schedule.")
+                        st.error("Closed")
+
+                    if reg.registration_opens_at:
+                        st.info(reg.registration_opens_at)
+
+                    if reg.register_cta_text:
+                        st.caption(f"CTA: {reg.register_cta_text} {'(disabled)' if reg.register_disabled else ''}")
+
+                    # Show member eligibility
+                    for m in reg.unregistered_members:
+                        st.caption(f"Eligible: {m.get('name')} (ID {m.get('id')})")
+                    for m in reg.registered_members:
+                        st.caption(f"Already registered: {m.get('name')}")
+
+                    # Also update member list if we see new members
+                    if reg.unregistered_members or reg.registered_members:
+                        api.discover_members(session, ev.event_id)
+                else:
+                    st.error("Could not fetch availability. Try reloading the schedule.")
 
             if st.button("Add to Watchlist", key=f"watch_{i}"):
                 if not selected_member_ids:
                     st.error("Select at least one member above.")
-                elif not session:
-                    st.error("Not logged in — load schedule first.")
                 else:
-                    # Use the user-selected member IDs
-                    monitor.watch(ev, selected_email, selected_member_ids)
+                    monitor.watch(ev, selected_email, [int(mid) for mid in selected_member_ids])
                     names = selected_member_labels if selected_member_labels else selected_member_ids
                     st.success(f"Watching **{ev.title}** for {names}")
 
             if st.button("Register NOW", key=f"reg_{i}"):
-                if not session:
-                    st.error("Not logged in — load schedule first.")
-                elif not selected_member_ids:
+                if not selected_member_ids:
                     st.error("Select at least one member above.")
                 else:
                     with st.spinner("Registering …"):
