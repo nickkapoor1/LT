@@ -407,7 +407,7 @@ class LifetimeAPI:
             if "registration will be open" in notification.lower():
                 return RegistrationResult(success=False, message=notification)
 
-        reg_id = data.get("id", "")
+        reg_id = data.get("id", "") or data.get("regId", "")
         if not reg_id:
             return RegistrationResult(
                 success=False,
