@@ -56,7 +56,17 @@ api: LifetimeAPI = st.session_state.api
 # ---------------------------------------------------------------------------
 # Sidebar
 # ---------------------------------------------------------------------------
+import subprocess
+def _get_git_info() -> str:
+    try:
+        sha = subprocess.check_output(["git", "log", "-1", "--format=%h"], cwd=str(PROJECT_ROOT), stderr=subprocess.DEVNULL).decode().strip()
+        date = subprocess.check_output(["git", "log", "-1", "--format=%ci"], cwd=str(PROJECT_ROOT), stderr=subprocess.DEVNULL).decode().strip()[:16]
+        return f"v1.0 | {date} ({sha})"
+    except Exception:
+        return "v1.0"
+
 st.sidebar.title("Pickleball Sniper")
+st.sidebar.caption(_get_git_info())
 page = st.sidebar.radio("Navigate", ["Dashboard", "Accounts", "Schedule", "Settings"])
 
 st.sidebar.markdown("---")
@@ -439,13 +449,24 @@ def page_schedule():
                     st.error("Select at least one member above.")
                 else:
                     with st.spinner("Registering …"):
-                        result = api.register(session, ev.event_id, [int(mid) for mid in selected_member_ids])
-                        if result.success:
-                            st.success(f"Registered! {result.message}")
-                        elif result.waitlisted:
-                            st.warning(f"Waitlisted: {result.message}")
-                        else:
-                            st.error(f"Failed: {result.message}")
+                        try:
+                            # Re-authenticate if session is stale
+                            if not session or not session.authenticated or session.is_expired():
+                                session = api.ensure_authenticated(acct["email"], acct["password"])
+                            if not session or not session.authenticated:
+                                st.error("Login failed — check your credentials in the Accounts tab.")
+                            else:
+                                member_ids_int = [int(mid) for mid in selected_member_ids]
+                                st.caption(f"Registering members {member_ids_int} for event {ev.event_id[:20]}…")
+                                result = api.register(session, ev.event_id, member_ids_int)
+                                if result.success:
+                                    st.success(f"Registered! {result.message}")
+                                elif result.waitlisted:
+                                    st.warning(f"Waitlisted: {result.message}")
+                                else:
+                                    st.error(f"Failed: {result.message}")
+                        except Exception as exc:
+                            st.error(f"Registration error: {exc}")
 
         st.divider()
 
