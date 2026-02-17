@@ -25,6 +25,9 @@ class WatchedEvent:
     last_checked: str = ""
     last_status: str = ""
     registration_status: str = "pending"  # pending | registered | waitlisted | failed
+    # Precise registration open timing
+    registration_opens_at_dt: datetime | None = None   # exact datetime registration opens
+    registration_opens_at_display: str = ""             # human-readable display string
 
     @property
     def key(self) -> str:

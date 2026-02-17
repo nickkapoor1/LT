@@ -110,6 +110,21 @@ def page_dashboard():
             col1, col2, col3 = st.columns([5, 3, 2])
             col1.markdown(f"{icon} **{ws.event.title}**")
             col1.caption(f"{ws.event.display_time()} | {ws.event.location}")
+
+            # Show registration open time if known
+            if ws.registration_opens_at_dt:
+                from datetime import datetime as _dt
+                now = _dt.now()
+                seconds_until = (ws.registration_opens_at_dt - now).total_seconds()
+                if seconds_until > 0:
+                    countdown = scheduler._format_countdown(seconds_until)
+                    col1.markdown(f"⏰ **Registration opens:** {ws.registration_opens_at_display} (in {countdown})")
+                    # Show if snipe is scheduled
+                    if ws.key in scheduler._snipe_threads:
+                        col1.markdown("🎯 **Snipe thread active** — will fire at exact open time")
+                else:
+                    col1.markdown(f"⏰ Registration opened at {ws.registration_opens_at_display}")
+
             col2.write(f"Account: {ws.account_email}")
             col2.write(f"Status: **{ws.registration_status}** | Last: {ws.last_status or '—'} ({ws.last_checked or 'never'})")
             col2.write(f"Members: {ws.member_ids}")
@@ -379,6 +394,22 @@ def page_schedule():
 
                     if reg.registration_opens_at:
                         st.info(reg.registration_opens_at)
+
+                    # Show computed exact open time
+                    if reg.too_soon_minutes and ev.start:
+                        try:
+                            event_start_dt = datetime.fromisoformat(ev.start)
+                            opens_at_dt = event_start_dt - timedelta(minutes=reg.too_soon_minutes)
+                            now = datetime.now()
+                            time_until = opens_at_dt - now
+                            if time_until.total_seconds() > 0:
+                                countdown = scheduler._format_countdown(time_until.total_seconds())
+                                st.info(
+                                    f"Registration opens **{opens_at_dt.strftime('%a %b %d, %I:%M %p')}** "
+                                    f"(in {countdown}). Add to watchlist — the engine will auto-register at the exact moment."
+                                )
+                        except Exception:
+                            pass
 
                     if reg.register_cta_text:
                         st.caption(f"CTA: {reg.register_cta_text} {'(disabled)' if reg.register_disabled else ''}")

@@ -64,6 +64,10 @@ class Scheduler:
         self._error_counts: dict[str, int] = {}
         self._max_workers = 4  # max concurrent account threads
 
+        # Snipe timers — one thread per event that fires at exact open time
+        self._snipe_threads: dict[str, threading.Thread] = {}
+        self._snipe_fired: set[str] = set()  # event keys already sniped
+
     # ------------------------------------------------------------------
     # Control
     # ------------------------------------------------------------------
@@ -87,6 +91,12 @@ class Scheduler:
         self.running = False
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=10)
+        # Clean up snipe threads
+        for t in self._snipe_threads.values():
+            if t.is_alive():
+                t.join(timeout=3)
+        self._snipe_threads.clear()
+        self._snipe_fired.clear()
         self._log("system", "Engine stopped.")
 
     # ------------------------------------------------------------------
@@ -120,21 +130,31 @@ class Scheduler:
             return self.poll_interval
 
         now = datetime.now()
-        min_minutes_away = float("inf")
+        min_seconds_away = float("inf")
 
         for ws in pending:
-            if ws.event.too_soon_minutes > 0:
+            # Use the stored precise open time if available
+            if ws.registration_opens_at_dt:
+                seconds_away = (ws.registration_opens_at_dt - now).total_seconds()
+                if seconds_away < min_seconds_away:
+                    min_seconds_away = seconds_away
+            elif ws.event.too_soon_minutes > 0:
                 try:
                     event_start = datetime.fromisoformat(ws.event.start)
                     opens_at = event_start - timedelta(minutes=ws.event.too_soon_minutes)
-                    minutes_away = (opens_at - now).total_seconds() / 60
-                    if minutes_away < min_minutes_away:
-                        min_minutes_away = minutes_away
+                    seconds_away = (opens_at - now).total_seconds()
+                    if seconds_away < min_seconds_away:
+                        min_seconds_away = seconds_away
                 except Exception:
                     pass
 
+        min_minutes_away = min_seconds_away / 60
+
         # Scale interval based on proximity
-        if min_minutes_away <= 1:
+        if min_seconds_away <= 10:
+            # Within 10 seconds: maximum speed (snipe threads handle the exact moment)
+            return self.snipe_interval
+        elif min_minutes_away <= 1:
             # Within 1 minute: maximum speed
             return self.snipe_interval
         elif min_minutes_away <= 5:
@@ -238,6 +258,22 @@ class Scheduler:
         if reg_info.registration_opens_at and not ws.event.registration_opens_at:
             ws.event.registration_opens_at = reg_info.registration_opens_at
 
+        # Compute and store precise registration open datetime
+        if reg_info.too_soon_minutes and not ws.registration_opens_at_dt:
+            try:
+                event_start = datetime.fromisoformat(ws.event.start)
+                opens_at_dt = event_start - timedelta(minutes=reg_info.too_soon_minutes)
+                ws.registration_opens_at_dt = opens_at_dt
+                ws.registration_opens_at_display = opens_at_dt.strftime("%a %b %d, %I:%M %p")
+                self._log(
+                    email,
+                    f"{ws.event.title}: Registration opens {ws.registration_opens_at_display} "
+                    f"({reg_info.too_soon_minutes} min before start)",
+                    "info",
+                )
+            except Exception as exc:
+                log.debug("Failed to parse open time for %s: %s", ws.event.title, exc)
+
         # Check if member is already registered
         registered_ids = {m.get("id") for m in reg_info.registered_members}
         target_ids = ws.member_ids
@@ -254,9 +290,23 @@ class Scheduler:
                 email, ws.event.title, reg_info.remaining_spots
             )
 
-        # If registration is disabled (too soon), just log and wait
+        # If registration is disabled (too soon), schedule a precise snipe
         if reg_info.register_disabled:
-            if reg_info.registration_opens_at:
+            if ws.registration_opens_at_dt:
+                now = datetime.now()
+                seconds_until = (ws.registration_opens_at_dt - now).total_seconds()
+                if seconds_until > 0:
+                    self._log(
+                        email,
+                        f"{ws.event.title}: Opens in {self._format_countdown(seconds_until)} "
+                        f"({ws.registration_opens_at_display})",
+                    )
+                    # Launch a precision snipe thread if not already running
+                    self._schedule_snipe(ws, acct, seconds_until)
+                else:
+                    # Open time has passed but API still says disabled — retry immediately
+                    self._log(email, f"{ws.event.title}: Open time passed, retrying …")
+            elif reg_info.registration_opens_at:
                 self._log(email, f"{ws.event.title}: {reg_info.registration_opens_at}")
             else:
                 self._log(email, f"{ws.event.title}: Registration not yet open.")
@@ -277,6 +327,125 @@ class Scheduler:
         else:
             # Don't mark as permanently failed — keep retrying
             self._log(email, f"Registration attempt failed: {result.message}", "warning")
+
+    # ------------------------------------------------------------------
+    # Precision snipe — fires registration at exact open moment
+    # ------------------------------------------------------------------
+
+    def _schedule_snipe(self, ws: WatchedEvent, acct: dict, seconds_until: float) -> None:
+        """
+        Launch a background thread that sleeps until the exact registration
+        open time, then fires rapid registration attempts.
+        """
+        snipe_key = ws.key
+        if snipe_key in self._snipe_fired or snipe_key in self._snipe_threads:
+            return  # already scheduled or already fired
+
+        # Only schedule if open time is within 2 hours (avoid sleeping forever)
+        if seconds_until > 7200:
+            return
+
+        self._log(
+            ws.account_email,
+            f"SNIPE SCHEDULED: {ws.event.title} — firing in {self._format_countdown(seconds_until)}",
+            "info",
+        )
+
+        thread = threading.Thread(
+            target=self._snipe_worker,
+            args=(ws, acct, seconds_until),
+            daemon=True,
+            name=f"snipe-{ws.event.event_id[:8]}",
+        )
+        self._snipe_threads[snipe_key] = thread
+        thread.start()
+
+    def _snipe_worker(self, ws: WatchedEvent, acct: dict, seconds_until: float) -> None:
+        """
+        Worker thread: sleep until open time, then fire registration rapidly.
+        """
+        email = ws.account_email
+        snipe_key = ws.key
+
+        try:
+            # Sleep until 2 seconds before open time (coarse sleep)
+            coarse_wait = max(0, seconds_until - 2)
+            if coarse_wait > 0:
+                # Sleep in 1-second ticks so we can stop if engine stops
+                for _ in range(int(coarse_wait)):
+                    if self._stop_event.is_set() or ws.registration_status != "pending":
+                        return
+                    time.sleep(1)
+
+            # Precision wait: busy-wait the final 2 seconds for exact timing
+            if ws.registration_opens_at_dt:
+                while datetime.now() < ws.registration_opens_at_dt:
+                    if self._stop_event.is_set() or ws.registration_status != "pending":
+                        return
+                    time.sleep(0.05)  # 50ms precision
+
+            # GO! Fire registration immediately
+            self._log(email, f"SNIPE FIRING for {ws.event.title}!", "info")
+            self._snipe_fired.add(snipe_key)
+
+            # Re-authenticate for a fresh session
+            session = self._api.ensure_authenticated(acct["email"], acct["password"])
+            if not session.authenticated:
+                self._log(email, f"Snipe auth failed for {ws.event.title}", "error")
+                return
+
+            # Rapid-fire registration attempts (up to 5 tries within a few seconds)
+            for attempt in range(1, 6):
+                if self._stop_event.is_set() or ws.registration_status != "pending":
+                    return
+
+                self._log(
+                    email,
+                    f"Snipe attempt {attempt}/5 for {ws.event.title} …",
+                )
+                result = self._api.register(session, ws.event.event_id, ws.member_ids)
+
+                if result.success:
+                    self.monitor.mark_registered(ws)
+                    self._log(email, f"SNIPE SUCCESS! Registered for {ws.event.title}!", "success")
+                    self._notifier.notify_registered(email, ws.event.title, ws.event.display_time())
+                    return
+                elif result.waitlisted:
+                    self.monitor.mark_waitlisted(ws)
+                    self._log(email, f"Snipe: Waitlisted for {ws.event.title}.", "warning")
+                    self._notifier.notify_waitlisted(email, ws.event.title, ws.event.display_time())
+                    return
+                else:
+                    self._log(
+                        email,
+                        f"Snipe attempt {attempt} failed: {result.message}",
+                        "warning",
+                    )
+                    # Very short delay between rapid attempts
+                    time.sleep(0.3)
+
+            self._log(email, f"Snipe exhausted 5 attempts for {ws.event.title}. Normal polling will continue.", "warning")
+
+        except Exception as exc:
+            log.error("[%s] Snipe worker error: %s", email, exc)
+            self._log(email, f"Snipe error: {exc}", "error")
+        finally:
+            self._snipe_threads.pop(snipe_key, None)
+
+    @staticmethod
+    def _format_countdown(seconds: float) -> str:
+        """Format seconds into a readable countdown string."""
+        if seconds < 0:
+            return "NOW"
+        hours = int(seconds // 3600)
+        minutes = int((seconds % 3600) // 60)
+        secs = int(seconds % 60)
+        if hours > 0:
+            return f"{hours}h {minutes}m {secs}s"
+        elif minutes > 0:
+            return f"{minutes}m {secs}s"
+        else:
+            return f"{secs}s"
 
     # ------------------------------------------------------------------
     # Activity log
