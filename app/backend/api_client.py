@@ -660,3 +660,42 @@ class LifetimeAPI:
             return RegistrationResult(success=False, waitlisted=True, reg_id=reg_id, message=msg2 or full_resp_text[:200])
 
         return RegistrationResult(success=False, reg_id=reg_id, message=f"Complete failed ({resp2.status_code}): {msg2 or full_resp_text[:200]}")
+
+    # ------------------------------------------------------------------
+    # Cancellation
+    # ------------------------------------------------------------------
+
+    def cancel_registration(
+        self,
+        session: AuthSession,
+        reg_id: str,
+    ) -> RegistrationResult:
+        """
+        Cancel an existing registration.
+
+        Uses PUT /sys/registrations/V3/ux/event/{reg_id}/cancel
+        """
+        url = REG_CANCEL_URL.format(reg_id=reg_id)
+        log.info("[%s] Cancelling registration %s", session.email, reg_id)
+        try:
+            resp = requests.put(url, json={}, headers=self._headers(session), timeout=15)
+            log.debug("[%s] Cancel response: %d %s", session.email, resp.status_code, resp.text[:500])
+
+            if resp.status_code == 401:
+                return RegistrationResult(success=False, message="Auth expired.")
+
+            if resp.ok:
+                log.info("[%s] Cancelled registration %s", session.email, reg_id)
+                return RegistrationResult(success=True, reg_id=reg_id, message="Registration cancelled.")
+
+            data = {}
+            try:
+                data = resp.json() if resp.text else {}
+            except Exception:
+                pass
+            msg = data.get("message", "") or data.get("error", "") or resp.text[:200]
+            return RegistrationResult(success=False, reg_id=reg_id, message=f"Cancel failed ({resp.status_code}): {msg}")
+
+        except Exception as exc:
+            log.error("[%s] Cancel error for %s: %s", session.email, reg_id, exc)
+            return RegistrationResult(success=False, message=f"Error: {exc}")
