@@ -21,7 +21,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from app.backend.api_client import LifetimeAPI
 from app.backend.crypto import load_accounts
@@ -129,12 +129,12 @@ class Scheduler:
         if not pending:
             return self.poll_interval
 
-        now = datetime.now()
         min_seconds_away = float("inf")
 
         for ws in pending:
             # Use the stored precise open time if available
             if ws.registration_opens_at_dt:
+                now = datetime.now(tz=ws.registration_opens_at_dt.tzinfo or timezone.utc)
                 seconds_away = (ws.registration_opens_at_dt - now).total_seconds()
                 if seconds_away < min_seconds_away:
                     min_seconds_away = seconds_away
@@ -142,6 +142,7 @@ class Scheduler:
                 try:
                     event_start = datetime.fromisoformat(ws.event.start)
                     opens_at = event_start - timedelta(minutes=ws.event.too_soon_minutes)
+                    now = datetime.now(tz=opens_at.tzinfo or timezone.utc)
                     seconds_away = (opens_at - now).total_seconds()
                     if seconds_away < min_seconds_away:
                         min_seconds_away = seconds_away
@@ -293,7 +294,7 @@ class Scheduler:
         # If registration is disabled (too soon), schedule a precise snipe
         if reg_info.register_disabled:
             if ws.registration_opens_at_dt:
-                now = datetime.now()
+                now = datetime.now(tz=ws.registration_opens_at_dt.tzinfo or timezone.utc)
                 seconds_until = (ws.registration_opens_at_dt - now).total_seconds()
                 if seconds_until > 0:
                     self._log(
@@ -406,7 +407,7 @@ class Scheduler:
             # Precision wait: busy-wait until PRE_FIRE_SEC before open time
             if ws.registration_opens_at_dt:
                 fire_at = ws.registration_opens_at_dt - timedelta(seconds=PRE_FIRE_SEC)
-                while datetime.now() < fire_at:
+                while datetime.now(tz=ws.registration_opens_at_dt.tzinfo or timezone.utc) < fire_at:
                     if self._stop_event.is_set() or ws.registration_status != "pending":
                         return
                     time.sleep(0.05)  # 50ms precision

@@ -123,8 +123,8 @@ def page_dashboard():
 
             # Show registration open time if known
             if ws.registration_opens_at_dt:
-                from datetime import datetime as _dt
-                now = _dt.now()
+                from datetime import datetime as _dt, timezone as _tz
+                now = _dt.now(tz=ws.registration_opens_at_dt.tzinfo or _tz.utc)
                 seconds_until = (ws.registration_opens_at_dt - now).total_seconds()
                 if seconds_until > 0:
                     countdown = scheduler._format_countdown(seconds_until)
@@ -495,12 +495,12 @@ def page_schedule():
                     reg = api.get_event_registration(session, ev.event_id)
                     if reg and reg.too_soon_minutes and ev.start:
                         try:
-                            from datetime import datetime as _dt
+                            from datetime import datetime as _dt, timezone as _tz
                             event_start = _dt.fromisoformat(ev.start)
                             opens_at = event_start - timedelta(minutes=reg.too_soon_minutes)
                             ws.registration_opens_at_dt = opens_at
                             ws.registration_opens_at_display = opens_at.strftime("%a %b %d, %I:%M %p")
-                            now = _dt.now()
+                            now = _dt.now(tz=opens_at.tzinfo or _tz.utc)
                             delta = (opens_at - now).total_seconds()
                             if delta > 0:
                                 countdown = scheduler._format_countdown(delta)
