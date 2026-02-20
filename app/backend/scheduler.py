@@ -27,6 +27,7 @@ from app.backend.api_client import LifetimeAPI
 from app.backend.crypto import load_accounts
 from app.backend.monitor import Monitor, WatchedEvent
 from app.backend.notifier import Notifier
+from app.backend.rules import WatchRule, load_rules
 from app.config import settings
 
 log = logging.getLogger(__name__)
@@ -68,6 +69,11 @@ class Scheduler:
         self._snipe_threads: dict[str, threading.Thread] = {}
         self._snipe_fired: set[str] = set()  # event keys already sniped
 
+        # Auto-watch rules scanning
+        self._last_rule_scan: float = 0.0
+        self._rule_scan_interval: int = 300  # scan for new events every 5 min
+        self._rule_matched_ids: set[str] = set()  # event IDs already matched (avoid duplicates)
+
     # ------------------------------------------------------------------
     # Control
     # ------------------------------------------------------------------
@@ -97,6 +103,8 @@ class Scheduler:
                 t.join(timeout=3)
         self._snipe_threads.clear()
         self._snipe_fired.clear()
+        self._rule_matched_ids.clear()
+        self._last_rule_scan = 0.0
         self._log("system", "Engine stopped.")
 
     # ------------------------------------------------------------------
@@ -104,12 +112,22 @@ class Scheduler:
     # ------------------------------------------------------------------
 
     def _loop(self) -> None:
+        # Run an initial rule scan on startup
+        self._scan_rules()
+
         while not self._stop_event.is_set():
             try:
                 self._poll_cycle()
             except Exception as exc:
                 log.error("Scheduler cycle error: %s", exc)
                 self._log("system", f"Cycle error: {exc}", "error")
+
+            # Periodically scan for new events matching auto-watch rules
+            try:
+                self._scan_rules()
+            except Exception as exc:
+                log.error("Rule scan error: %s", exc)
+                self._log("system", f"Rule scan error: {exc}", "error")
 
             # Adaptive interval: check if any watched event opens soon
             interval = self._compute_interval()
@@ -335,6 +353,115 @@ class Scheduler:
         else:
             # Don't mark as permanently failed — keep retrying
             self._log(email, f"Registration attempt failed: {result.message}", "warning")
+
+    # ------------------------------------------------------------------
+    # Auto-watch rule scanning
+    # ------------------------------------------------------------------
+
+    def _scan_rules(self) -> None:
+        """
+        Periodically fetch events from clubs referenced in active rules,
+        match them, and auto-watch any new matches.
+        """
+        now = time.time()
+        if now - self._last_rule_scan < self._rule_scan_interval:
+            return
+        self._last_rule_scan = now
+
+        rules = load_rules()
+        active = [r for r in rules if r.enabled]
+        if not active:
+            return
+
+        all_accounts = {a["email"].lower(): a for a in load_accounts()}
+
+        # Collect unique (account, club) pairs we need to scan
+        scan_targets: dict[str, set[str]] = {}  # email -> set of club names
+        for rule in active:
+            email = rule.account_email
+            if email.lower() not in all_accounts:
+                continue
+            scan_targets.setdefault(email, set()).update(rule.clubs)
+
+        # Date range: today + 7 days
+        today = datetime.now()
+        start_str = today.strftime("%m/%d/%Y")
+        end_str = (today + timedelta(days=7)).strftime("%m/%d/%Y")
+
+        total_added = 0
+
+        for email, clubs in scan_targets.items():
+            if self._stop_event.is_set():
+                return
+            acct = all_accounts[email.lower()]
+            session = self._api.ensure_authenticated(acct["email"], acct["password"])
+            if not session or not session.authenticated:
+                continue
+
+            # Fetch events from each club
+            all_events = []
+            for club_name in clubs:
+                if self._stop_event.is_set():
+                    return
+                try:
+                    events = self._api.get_events(session, club_name, start_str, end_str)
+                    all_events.extend(events)
+                except Exception as exc:
+                    log.warning("[%s] Rule scan failed for club %s: %s", email, club_name, exc)
+
+            if not all_events:
+                continue
+
+            # Discover members from first event (ensures member IDs are populated)
+            try:
+                self._api.discover_members(session, all_events[0].event_id)
+            except Exception:
+                pass
+
+            # Match events against rules for this account
+            account_rules = [r for r in active if r.account_email == email]
+            already_watched = {ws.event.event_id for ws in self.monitor.all_watched() if ws.account_email == email}
+
+            for ev in all_events:
+                if ev.event_id in already_watched or ev.event_id in self._rule_matched_ids:
+                    continue
+
+                for rule in account_rules:
+                    if rule.matches(ev.title, ev.club or ev.location, ev.start):
+                        # Auto-watch this event
+                        member_ids = rule.member_ids
+                        # If rule has no specific members, use all on the account
+                        if not member_ids:
+                            member_ids = session.get_all_member_ids()
+                        if not member_ids:
+                            continue
+
+                        ws = self.monitor.watch(ev, email, member_ids)
+
+                        # Try to get snipe timing
+                        try:
+                            reg = self._api.get_event_registration(session, ev.event_id)
+                            if reg and reg.too_soon_minutes and ev.start:
+                                event_start = datetime.fromisoformat(ev.start)
+                                opens_at = event_start - timedelta(minutes=reg.too_soon_minutes)
+                                ws.registration_opens_at_dt = opens_at
+                                ws.registration_opens_at_display = opens_at.strftime("%a %b %d, %I:%M %p")
+                        except Exception:
+                            pass
+
+                        self._rule_matched_ids.add(ev.event_id)
+                        total_added += 1
+                        self._log(
+                            email,
+                            f"Auto-watched: {ev.title} ({ev.display_time()}) @ {ev.club or ev.location} "
+                            f"[rule: {rule.name}]",
+                        )
+                        break  # One match per event is enough
+
+        if total_added:
+            self._log("system", f"Rule scan: auto-watched {total_added} new event(s).")
+        else:
+            log.debug("Rule scan complete — no new matches.")
 
     # ------------------------------------------------------------------
     # Precision snipe — fires registration at exact open moment

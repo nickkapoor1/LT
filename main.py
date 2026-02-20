@@ -22,6 +22,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from app.backend.api_client import LifetimeAPI, Event, MemberInfo
 from app.backend.crypto import add_account, load_accounts, remove_account, save_accounts
 from app.backend.monitor import Monitor
+from app.backend.rules import WatchRule, load_rules, save_rules, add_rule, remove_rule
 from app.backend.notifier import load_notify_settings, save_notify_settings
 from app.backend.scheduler import Scheduler
 from app.config.settings import CLUBS, CLUB_REGIONS, DEFAULT_POLL_INTERVAL_SEC, MIN_POLL_INTERVAL_SEC, MAX_POLL_INTERVAL_SEC
@@ -80,17 +81,19 @@ else:
     if st.sidebar.button("Start Engine", type="primary", use_container_width=True):
         accounts = load_accounts()
         pending = monitor.pending()
+        active_rules = [r for r in load_rules() if r.enabled]
         if not accounts:
             st.sidebar.error("Add at least one account first.")
-        elif not pending:
-            st.sidebar.error("Add sessions to your watchlist first.")
+        elif not pending and not active_rules:
+            st.sidebar.error("Add sessions to your watchlist or create an auto-watch rule first.")
         else:
             scheduler.start()
             st.rerun()
 
+_active_rules = sum(1 for r in load_rules() if r.enabled)
 st.sidebar.caption(
-    "Polling: **{}s** | {} account(s) | {} watched".format(
-        scheduler.poll_interval, len(load_accounts()), len(monitor.all_watched()),
+    "Polling: **{}s** | {} account(s) | {} watched | {} rule(s)".format(
+        scheduler.poll_interval, len(load_accounts()), len(monitor.all_watched()), _active_rules,
     )
 )
 
@@ -876,6 +879,145 @@ def page_settings():
         save_notify_settings(ns)
         st.success("Notification settings saved!")
 
+    # -- Auto-Watch Rules (Presets) --
+    st.subheader("Auto-Watch Rules")
+    st.caption(
+        "Define rules to automatically watch matching events. "
+        "The engine scans for new events every 5 minutes and queues matches for snipe registration."
+    )
+
+    rules = load_rules()
+
+    # Show existing rules
+    if rules:
+        for idx, rule in enumerate(rules):
+            with st.expander(
+                f"{'ON' if rule.enabled else 'OFF'} — {rule.name}",
+                expanded=False,
+            ):
+                st.markdown(f"**Account:** {rule.account_email}")
+                st.markdown(f"**Clubs:** {', '.join(rule.clubs) if rule.clubs else 'Any'}")
+                st.markdown(f"**Session types:** {', '.join(rule.session_types) if rule.session_types else 'Any'}")
+                st.markdown(f"**Min level:** {rule.min_level if rule.min_level > 0 else 'Any'}")
+                st.markdown(f"**Time window:** {rule.time_earliest} – {rule.time_latest}")
+                if rule.title_contains:
+                    st.markdown(f"**Title keywords:** {', '.join(rule.title_contains)}")
+                if rule.days_of_week:
+                    day_names = {0: "Mon", 1: "Tue", 2: "Wed", 3: "Thu", 4: "Fri", 5: "Sat", 6: "Sun"}
+                    st.markdown(f"**Days:** {', '.join(day_names[d] for d in rule.days_of_week if d in day_names)}")
+                st.markdown(f"**Members:** {rule.member_ids if rule.member_ids else 'All on account'}")
+
+                rc1, rc2 = st.columns(2)
+                with rc1:
+                    new_enabled = st.checkbox("Enabled", value=rule.enabled, key=f"rule_en_{idx}")
+                    if new_enabled != rule.enabled:
+                        rules[idx].enabled = new_enabled
+                        save_rules(rules)
+                        st.rerun()
+                with rc2:
+                    if st.button("Delete", key=f"rule_del_{idx}"):
+                        remove_rule(idx)
+                        st.rerun()
+    else:
+        st.info("No rules yet. Add one below.")
+
+    # Add new rule form
+    with st.expander("Add New Rule", expanded=not rules):
+        accounts = load_accounts()
+        enabled_accounts = [a for a in accounts if a.get("enabled", True)]
+
+        if not enabled_accounts:
+            st.warning("Add an account first.")
+        else:
+            r_name = st.text_input("Rule name", placeholder="e.g. BYO Partner Drill 8pm Penn")
+
+            r_email = st.selectbox("Account", [a["email"] for a in enabled_accounts], key="rule_acct")
+
+            r_clubs = st.multiselect(
+                "Clubs",
+                options=list(CLUBS.keys()),
+                default=[],
+                help="Which clubs to search. Leave empty for all clubs in the account.",
+                key="rule_clubs",
+            )
+
+            SESSION_TYPE_OPTIONS = ["Drill / Clinic", "Open Play", "Round Robin", "League", "Tournament", "Other"]
+            r_types = st.multiselect(
+                "Session types",
+                options=SESSION_TYPE_OPTIONS,
+                default=[],
+                help="Leave empty for all types.",
+                key="rule_types",
+            )
+
+            r_min_level = st.number_input(
+                "Minimum skill level (0 = any)",
+                min_value=0.0, max_value=7.0, value=0.0, step=0.5,
+                key="rule_level",
+            )
+
+            tc1, tc2 = st.columns(2)
+            with tc1:
+                r_earliest = st.time_input("Earliest start time", value=datetime.strptime("00:00", "%H:%M").time(), key="rule_t1")
+            with tc2:
+                r_latest = st.time_input("Latest start time", value=datetime.strptime("23:59", "%H:%M").time(), key="rule_t2")
+
+            r_keywords_str = st.text_input(
+                "Title keywords (comma-separated, optional)",
+                placeholder="e.g. bring your own partner, BYO",
+                key="rule_kw",
+            )
+            r_keywords = [kw.strip() for kw in r_keywords_str.split(",") if kw.strip()] if r_keywords_str else []
+
+            DAY_OPTIONS = {"Mon": 0, "Tue": 1, "Wed": 2, "Thu": 3, "Fri": 4, "Sat": 5, "Sun": 6}
+            r_days_labels = st.multiselect(
+                "Days of week (leave empty for all)",
+                options=list(DAY_OPTIONS.keys()),
+                default=[],
+                key="rule_days",
+            )
+            r_days = [DAY_OPTIONS[d] for d in r_days_labels]
+
+            # Get member IDs for selected account
+            r_member_ids: list[int] = []
+            rule_sess = api.get_session(r_email)
+            if rule_sess and rule_sess.members:
+                member_opts = {f"{m.display_name()} (ID {m.member_id})": m.member_id for m in rule_sess.members}
+                r_member_labels = st.multiselect(
+                    "Members to register (leave empty for all)",
+                    options=list(member_opts.keys()),
+                    default=[],
+                    key="rule_members",
+                )
+                r_member_ids = [member_opts[lbl] for lbl in r_member_labels]
+            else:
+                st.caption("Log in first (Load Schedule) to see members, or leave empty for all.")
+
+            if st.button("Save Rule", type="primary", key="save_rule"):
+                if not r_name:
+                    st.error("Give the rule a name.")
+                elif not r_clubs:
+                    st.error("Select at least one club.")
+                else:
+                    new_rule = WatchRule(
+                        name=r_name,
+                        account_email=r_email,
+                        member_ids=r_member_ids,
+                        clubs=r_clubs,
+                        session_types=r_types,
+                        min_level=r_min_level,
+                        time_earliest=r_earliest.strftime("%H:%M"),
+                        time_latest=r_latest.strftime("%H:%M"),
+                        title_contains=r_keywords,
+                        days_of_week=r_days,
+                        enabled=True,
+                    )
+                    add_rule(new_rule)
+                    st.success(f"Rule **{r_name}** saved!")
+                    st.rerun()
+
+    st.divider()
+
     # -- Watchlist --
     st.subheader("Watchlist")
     watched = monitor.all_watched()
@@ -893,11 +1035,15 @@ def page_settings():
     st.markdown(
         """
         1. **Add your account** in the Accounts tab.
-        2. **Load the schedule** to see upcoming pickleball events.
-        3. **Add events to your watchlist** — pick the ones you want.
+        2. **Set up auto-watch rules** (above) for sessions you always want.
+        3. Or **manually add events** from the Schedule tab.
         4. **Start the engine** — it polls the API every few seconds.
-        5. The moment registration opens, it fires the register call instantly.
-        6. You'll get a **notification** (desktop/email) when it succeeds!
+        5. The engine **auto-scans** for events matching your rules every 5 minutes.
+        6. The moment registration opens, it fires the register call instantly.
+        7. You'll get a **notification** (desktop/email) when it succeeds!
+
+        **Auto-watch rules** let you define presets like "all 5.0+ drills at Penn & Sky"
+        — the engine finds matching events and queues them automatically.
 
         **Adaptive polling** automatically speeds up as registration windows
         approach — no need to manually adjust the interval.
